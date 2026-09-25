@@ -1,3 +1,10 @@
+// attitude_transform.h - independent quaternion/DCM/Euler conversions.
+// REFERENCE IMPLEMENTATION, not used by the flight firmware (PlatformIO
+// doesn't link it because nothing includes it). It is the independent
+// 321-sequence DCM check that the NWU sign convention in
+// flight_kinematics.h was verified against - keep it for re-verifying that
+// convention if the IMU mounting or AHRS library ever changes.
+
 #pragma once
 #include <Arduino.h>
 

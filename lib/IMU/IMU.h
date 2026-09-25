@@ -27,6 +27,7 @@
 #define MAG_SINGLE_MEAS 0b01
 #define MAG_CONTINUOUS_MEAS 0b00
 #define MAG_OUTPUT_REG 0x03
+#define MAG_OVERFLOW -4096
 
 #define MPU_ADDRESS 0x68
 #define MPU_PMGMT1 0x6B
@@ -91,7 +92,8 @@ uint8_t magModeReg(const int MD);
 
 void setMag(const uint8_t rega, const uint8_t regb, const uint8_t md);
 
-void readMag(D3 &magbuffer);
+// Returns false on an I2C failure or an overflowed axis; magbuffer is then untouched.
+bool readMag(D3 &magbuffer);
 
 void printUncalibratedMag(const D3 &magt);
 
@@ -107,13 +109,15 @@ uint8_t setAccFS(const int afs_sel);
 
 void setMPU(const uint8_t DLPF, const uint8_t FS_SEL, const uint8_t AFS_SEL);
 
-void readMPU(D3 &accbuffer, D3 &gyrobuffer);
+// Returns false on an I2C failure; the buffers are then untouched.
+bool readMPU(D3 &accbuffer, D3 &gyrobuffer);
 
 void printUncalibratedAccel(const D3 &acct);
 
 void applyAccelCalibration(const D3 &accelt, D3 &accelCalibrated);
 
-void measureGyroOffset(D3 &accelt, D3 &gyrot, D3 &gyroOffsetTemp);
+// Returns false if not a single read succeeded (offset left unchanged).
+bool measureGyroOffset(D3 &accelt, D3 &gyrot, D3 &gyroOffsetTemp);
 
 void calibrateGyro(D3 &gyrot, const D3 &gyrotOffset, D3 &gyroCalibrated);
 

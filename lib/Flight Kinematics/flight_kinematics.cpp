@@ -10,13 +10,20 @@ namespace raven {
 // ---------------------------------------------------------------------------
 // small float helpers
 // ---------------------------------------------------------------------------
-static const float kPi     = 3.14159265f;
-static const float kHalfPi = 1.57079633f;
+static const float kPi       = 3.14159265f;
+static const float kHalfPi   = 1.57079633f;
+static const float kTwoPi    = 6.28318531f;
+static const float kDegToRad = 0.017453292f;
 
 static inline float clampf(float v, float lo, float hi) {
     return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 static inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+static inline float wrapPi(float a) {
+    while (a >  kPi) a -= kTwoPi;
+    while (a < -kPi) a += kTwoPi;
+    return a;
+}
 
 const char *flightModeName(FlightMode m) {
     switch (m) {
@@ -26,6 +33,38 @@ const char *flightModeName(FlightMode m) {
         case FlightMode::FORWARD:    return "FORWARD";
         case FlightMode::TRANS_BACK: return "TRANS_BACK";
         case FlightMode::FAILSAFE:   return "FAILSAFE";
+    }
+    return "?";
+}
+
+const char *missionPhaseName(MissionPhase p) {
+    switch (p) {
+        case MissionPhase::NONE:    return "MANUAL";
+        case MissionPhase::TAKEOFF: return "TAKEOFF";
+        case MissionPhase::ENROUTE: return "ENROUTE";
+        case MissionPhase::LAND:    return "LAND";
+    }
+    return "?";
+}
+
+const char *failsafeReasonName(FailsafeReason r) {
+    switch (r) {
+        case FailsafeReason::NONE:      return "-";
+        case FailsafeReason::COMMANDED: return "COMMANDED";
+        case FailsafeReason::NAV_LOST:  return "NAV_LOST";
+        case FailsafeReason::IMU:       return "IMU";
+        case FailsafeReason::BARO:      return "BARO";
+        case FailsafeReason::TERRAIN:   return "TERRAIN";
+    }
+    return "?";
+}
+
+const char *configIssueText(uint32_t bit) {
+    switch (bit) {
+        case CFG_BAD_MASS_INERTIA:   return "mass or inertia not positive";
+        case CFG_HOVER_THRUST:       return "hover needs more than 75% of max thrust (mass vs thrust_max_per_rotor)";
+        case CFG_NO_FULL_CONVERSION: return "wing can't carry the weight even at v_max_forward - forward flight stays partially converted (rotors lifting, power hungry)";
+        case CFG_CRUISE_BELOW_STALL: return "cruise_airspeed is below stall_margin * wing-only stall speed - rotors carry part of the weight in cruise";
     }
     return "?";
 }
@@ -47,7 +86,7 @@ enum : int { V_FUP = 0, V_FX, V_L, V_M, V_N, NV = 5 };
 
 // ---------------------------------------------------------------------------
 // Cholesky solve for the 5x5 symmetric positive-definite normal equations.
-// ~100 flops, single precision, no allocation. Trivial at 400 Hz on an ESP32.
+// ~100 flops, single precision, no allocation. Trivial at 100 Hz on an ESP32.
 // ---------------------------------------------------------------------------
 static bool cholDecompose(const float A[NV][NV], float L[NV][NV]) {
     for (int i = 0; i < NV; ++i) {
@@ -81,9 +120,9 @@ static void cholSolve(const float L[NV][NV], const float b[NV], float x[NV]) {
 }
 
 // ===========================================================================
-// setup
+// setup, arming, failsafe
 // ===========================================================================
-void FlightKinematics::begin(const VehicleConfig &cfg, const ControlGains &gains) {
+uint32_t FlightKinematics::begin(const VehicleConfig &cfg, const ControlGains &gains) {
     cfg_   = cfg;
     gains_ = gains;
 
@@ -93,65 +132,164 @@ void FlightKinematics::begin(const VehicleConfig &cfg, const ControlGains &gains
     pid_climb_hover_.setGains(gains_.climb_hover);
     pid_climb_fwd_.setGains(gains_.climb_fwd);
     pid_speed_fwd_.setGains(gains_.speed_fwd);
+    pid_heading_hold_.setGains(gains_.heading_hold);
+    pid_xtrack_to_latvel_hover_.setGains(gains_.xtrack_to_latvel_hover);
+    pid_latvel_to_roll_hover_.setGains(gains_.latvel_to_roll_hover);
+    pid_speed_hover_.setGains(gains_.speed_hover);
+    pid_xtrack_to_course_fwd_.setGains(gains_.xtrack_to_course_fwd);
+    pid_altitude_hold_.setGains(gains_.altitude_hold);
 
+    armed_     = false;
+    failsafe_  = false;
+    fs_reason_ = FailsafeReason::NONE;
+    phase_     = MissionPhase::NONE;
     reset();
+
+    config_issues_ = validateConfig();
+    return config_issues_;
 }
 
-void FlightKinematics::reset() {
+void FlightKinematics::resetControllers() {
     pid_rate_roll_.reset();
     pid_rate_pitch_.reset();
     pid_rate_yaw_.reset();
     pid_climb_hover_.reset();
     pid_climb_fwd_.reset();
     pid_speed_fwd_.reset();
+    pid_heading_hold_.reset();
+    pid_xtrack_to_latvel_hover_.reset();
+    pid_latvel_to_roll_hover_.reset();
+    pid_speed_hover_.reset();
+    pid_xtrack_to_course_fwd_.reset();
+    pid_altitude_hold_.reset();
+}
 
-    mode_           = armed_ ? FlightMode::HOVER : FlightMode::DISARMED;
+// Control state only. The position and altitude ESTIMATES (dead-reckoning,
+// baro/GNSS fusion, baro bias) are sensor state and keep running across
+// arm/disarm - resetting the bias estimate on every arm would throw away
+// minutes of GNSS calibration.
+void FlightKinematics::reset() {
+    resetControllers();
+
+    mode_           = armed_ ? (failsafe_ ? FlightMode::FAILSAFE : FlightMode::HOVER)
+                             : FlightMode::DISARMED;
     alpha_cmd_      = 0.0f;
     alpha_target_   = 0.0f;
     thrust_total_   = cfg_.mass * cfg_.g;
     nac_left_prev_  = 0.0f;
     nac_right_prev_ = 0.0f;
-    failsafe_       = false;
+
+    takeoff_hold_set_ = false;
+    fs_hold_set_      = false;
+    nav_lost_s_       = 0.0f;
+    land_descending_  = false;
+    land_timer_s_     = 0.0f;
+    landed_timer_s_   = 0.0f;
+    descend_time_s_   = 0.0f;
+    terrain_lost_s_   = 0.0f;
+    alt_ref_msl_      = false;
+    imu_bad_s_        = 0.0f;
+    baro_bad_s_       = 0.0f;
 }
 
-void FlightKinematics::setArmed(bool armed) {
-    if (armed && !armed_) {
-        reset();
-        armed_ = true;
-        mode_  = FlightMode::HOVER;
-    } else if (!armed) {
-        armed_ = false;
-        mode_  = FlightMode::DISARMED;
+bool FlightKinematics::arm(const char **reason) {
+    const char *why = nullptr;
+    const bool mission = fcode::loaded();
+
+    if (armed_)                                        why = "already armed";
+    else if (config_issues_ & CFG_FATAL_MASK)          why = "vehicle config invalid (see boot log)";
+    else if (!have_last_)                              why = "no sensor data yet";
+    else if (!last_raw_.imu_valid)                     why = "IMU not responding";
+    else if (!last_raw_.mag_valid)                     why = "magnetometer not responding";
+    else if (!last_raw_.ahrs_ready)                    why = "AHRS still converging - wait a few seconds";
+    else if (fabsf(last_st_.roll)  > cfg_.prearm_max_tilt_rad ||
+             fabsf(last_st_.pitch) > cfg_.prearm_max_tilt_rad) why = "vehicle not level";
+    else if (!last_raw_.baro_valid || !alt_fusion_primed_) why = "barometer not ready";
+    else if (mission && fcode::complete())             why = "mission already flown - reboot to reload it";
+    else if (mission && !last_st_.nav_valid)           why = "no GNSS position (a mission is loaded)";
+    else if (mission && last_raw_.gnss_sats < cfg_.prearm_min_sats) why = "too few GNSS satellites";
+    else if (mission && last_raw_.gnss_hdop > cfg_.prearm_max_hdop)  why = "GNSS HDOP too high";
+    else if (mission && hypotf(last_st_.pos_x, last_st_.pos_y) > cfg_.prearm_max_start_distance_m)
+        why = "too far from the mission start (F90)";
+    else if (mission && !mission_terrain_ok_)          why = "DEM tiles missing along the mission route";
+    else if (mission && !last_st_.terrain_valid)       why = "no DEM elevation at the current position";
+    else if (mission && gnss_alt_settle_s_ < cfg_.prearm_gnss_settle_s)
+        why = "altitude calibration settling (GNSS + baro) - wait ~30 s after fix";
+
+    if (why) {
+        if (reason) *reason = why;
+        return false;
     }
+
+    armed_     = true;
+    failsafe_  = false;
+    fs_reason_ = FailsafeReason::NONE;
+    reset();   // -> HOVER
+
+    // Fallback AGL reference in the baro-only frame - see ground_ref_baro_m_.
+    ground_ref_baro_m_ = baro_frame_alt_m_;
+    ground_ref_set_    = true;
+
+    phase_ = mission ? MissionPhase::TAKEOFF : MissionPhase::NONE;
+    if (reason) *reason = mission ? "armed - mission TAKEOFF"
+                                  : "armed - no mission, manual setpoints (hold level)";
+    return true;
 }
 
-void FlightKinematics::requestFailsafe() {
-    failsafe_ = true;
-    mode_     = FlightMode::FAILSAFE;
+void FlightKinematics::disarm() {
+    armed_    = false;
+    failsafe_ = false;
+    phase_    = MissionPhase::NONE;
+    mode_     = FlightMode::DISARMED;
+    resetControllers();
+}
+
+void FlightKinematics::requestFailsafe(FailsafeReason why) {
+    if (!armed_ || failsafe_) return;   // first reason wins; nothing to do on the ground
+    failsafe_    = true;
+    fs_reason_   = why;
+    fs_hold_set_ = false;
+    mode_        = FlightMode::FAILSAFE;
+}
+
+uint32_t FlightKinematics::validateConfig() const {
+    uint32_t issues = 0;
+    if (!(cfg_.mass > 0.0f) || !(cfg_.Ixx > 0.0f) || !(cfg_.Iyy > 0.0f) || !(cfg_.Izz > 0.0f))
+        issues |= CFG_BAD_MASS_INERTIA;
+
+    const float hover_fraction = cfg_.mass * cfg_.g / (2.0f * cfg_.thrust_max_per_rotor);
+    if (!(hover_fraction <= 0.75f)) issues |= CFG_HOVER_THRUST;
+
+    if (corridorCeiling(cfg_.v_max_forward, 1.225f) < kHalfPi - 0.03f) issues |= CFG_NO_FULL_CONVERSION;
+
+    if (cfg_.cruise_airspeed < cfg_.stall_margin * stallSpeed(1.225f))
+        issues |= CFG_CRUISE_BELOW_STALL;
+
+    return issues;
 }
 
 // ===========================================================================
 // analysis helpers
 // ===========================================================================
-void FlightKinematics::corridor(float V, float rho, float &a_min, float &a_max) const {
+// Ceiling: the wing must be able to carry whatever the rotors cannot.
+//     L_wing_required = m*g - T_avail*cos(alpha)
+//     q*S*CL_max/margin^2 >= L_wing_required
+//  => cos(alpha) >= (m*g - q*S*CL_max/margin^2) / T_avail
+// Only a fraction of max thrust may be assumed to go into lift - the rest is
+// the reserve attitude control needs.
+float FlightKinematics::corridorCeiling(float V, float rho) const {
     const float q          = 0.5f * rho * V * V;
-    const float T_max_tot  = 2.0f * cfg_.thrust_max_per_rotor;
+    const float T_avail    = cfg_.corridor_thrust_fraction * 2.0f * cfg_.thrust_max_per_rotor;
     const float margin_sq  = cfg_.stall_margin * cfg_.stall_margin;
-
-    // --- ceiling: the wing must be able to carry whatever the rotors cannot.
-    //     L_wing_required = m*g - T_max_total*cos(alpha)
-    //     q*S*CL_max/margin^2 >= L_wing_required
-    //  => cos(alpha) >= (m*g - q*S*CL_max/margin^2) / T_max_total
     const float lift_avail = q * cfg_.wing_area * cfg_.CL_max / margin_sq;
-    const float rhs        = (cfg_.mass * cfg_.g - lift_avail) / T_max_tot;
-    if (rhs >= 1.0f) {
-        a_max = 0.0f;                       // too slow to tilt at all
-    } else if (rhs <= -1.0f) {
-        a_max = kHalfPi;                    // wing can carry everything
-    } else {
-        a_max = acosf(rhs);
-        if (a_max > kHalfPi) a_max = kHalfPi;
-    }
+    const float rhs        = (cfg_.mass * cfg_.g - lift_avail) / fmaxf(T_avail, 1.0e-3f);
+    if (rhs >= 1.0f)  return 0.0f;          // too slow to tilt at all
+    if (rhs <= -1.0f) return kHalfPi;       // wing can carry everything
+    return fminf(acosf(rhs), kHalfPi);
+}
+
+void FlightKinematics::corridor(float V, float rho, float &a_min, float &a_max) const {
+    a_max = corridorCeiling(V, rho);
 
     // --- floor: do not fly fast with the nacelles near vertical.
     //     V <= v_max_hover + (v_max_fwd - v_max_hover)*sin(alpha)
@@ -162,7 +300,12 @@ void FlightKinematics::corridor(float V, float rho, float &a_min, float &a_max) 
         a_min = asinf(clampf((V - cfg_.v_max_hover) / span, 0.0f, 1.0f));
     }
 
-    if (a_min > a_max) a_max = a_min;  // corridor pinched: hold, do not invert
+    // Pinched (faster than the floor allows at the angle the wing can
+    // support): lift wins - tilting further than the wing can carry means
+    // losing altitude/stalling, while being a little too fast for the
+    // nacelle angle only costs drag and rotor loads. The speed loop is
+    // meanwhile slowing the aircraft back into the corridor.
+    if (a_min > a_max) a_min = a_max;
 }
 
 float FlightKinematics::expectedDynamicPressure(float alpha, float thrust_total) const {
@@ -206,27 +349,40 @@ float FlightKinematics::hoverPitchAuthority(float thrust_total) const {
     return thrust_total * cfg_.l_z;
 }
 
-float FlightKinematics::wingLift(const VehicleState &st) const {
-    if (!st.airspeed_valid || st.q_dyn < 1.0f) return 0.0f;
-    const float V   = fmaxf(st.airspeed, 1.0f);
-    const float fpa = atan2f(st.climb_rate, V);        // flight path angle
+float FlightKinematics::stallSpeed(float rho) const {
+    const float denom = rho * cfg_.wing_area * cfg_.CL_max;
+    if (!(denom > 0.0f)) return 1.0e6f;
+    return sqrtf(2.0f * cfg_.mass * cfg_.g / denom);
+}
+
+float FlightKinematics::wingLift(const VehicleState &st, float V, float q_dyn) const {
+    if (q_dyn < 1.0f) return 0.0f;
+    const float Vs  = fmaxf(V, 1.0f);
+    const float fpa = atan2f(st.climb_rate, Vs);       // flight path angle
     const float aoa = clampf(st.pitch - fpa, -0.35f, 0.35f);
-    const float CL  = clampf(cfg_.CL_alpha * aoa, -cfg_.CL_max, cfg_.CL_max);
-    return st.q_dyn * cfg_.wing_area * CL;
+    const float CL  = clampf(cfg_.CL_0 + cfg_.CL_alpha * aoa, -cfg_.CL_max, cfg_.CL_max);
+    return q_dyn * cfg_.wing_area * CL;
 }
 
 // ===========================================================================
 // mode machine  (hysteresis is mandatory - a single distance threshold chatters)
 // ===========================================================================
 void FlightKinematics::updateMode(const VehicleState &st) {
-    if (failsafe_) { mode_ = FlightMode::FAILSAFE; return; }
-    if (!armed_)   { mode_ = FlightMode::DISARMED; return; }
+    if (!armed_)   { mode_ = FlightMode::DISARMED; alpha_target_ = alpha_cmd_; return; }
+    if (failsafe_) { mode_ = FlightMode::FAILSAFE; alpha_target_ = 0.0f;       return; }
 
-    const bool  far   = st.nav_valid && (st.distance_to_go > cfg_.dist_to_forward);
-    const bool  near_ = st.nav_valid && (st.distance_to_go < cfg_.dist_to_hover);
+    // Conversion is a mission-ENROUTE-only affair, needs a live pitot (the
+    // corridor and every forward-flight law depend on real airspeed), and is
+    // judged on the distance left in the whole MISSION, not the segment.
+    const bool enroute    = (phase_ == MissionPhase::ENROUTE);
+    const bool far        = enroute && st.nav_valid && st.airspeed_valid &&
+                            (st.mission_distance_to_go > cfg_.dist_to_forward);
+    const bool need_hover = !enroute || !st.nav_valid || !st.airspeed_valid ||
+                            (st.mission_distance_to_go < cfg_.dist_to_hover);
 
     switch (mode_) {
         case FlightMode::DISARMED:
+        case FlightMode::FAILSAFE:
             mode_ = FlightMode::HOVER;
             break;
 
@@ -235,29 +391,24 @@ void FlightKinematics::updateMode(const VehicleState &st) {
             break;
 
         case FlightMode::TRANS_FWD:
-            if (near_)                              mode_ = FlightMode::TRANS_BACK;
+            if (need_hover)                         mode_ = FlightMode::TRANS_BACK;
             else if (alpha_cmd_ > kHalfPi - 0.03f)  mode_ = FlightMode::FORWARD;
             break;
 
         case FlightMode::FORWARD:
-            if (near_) mode_ = FlightMode::TRANS_BACK;
+            if (need_hover) mode_ = FlightMode::TRANS_BACK;
             break;
 
         case FlightMode::TRANS_BACK:
             if (far)                     mode_ = FlightMode::TRANS_FWD;
             else if (alpha_cmd_ < 0.03f) mode_ = FlightMode::HOVER;
             break;
-
-        default:
-            break;
     }
 
     switch (mode_) {
-        case FlightMode::HOVER:      alpha_target_ = 0.0f;    break;
         case FlightMode::TRANS_FWD:
         case FlightMode::FORWARD:    alpha_target_ = kHalfPi; break;
-        case FlightMode::TRANS_BACK: alpha_target_ = 0.0f;    break;
-        default:                     alpha_target_ = alpha_cmd_; break;
+        default:                     alpha_target_ = 0.0f;    break;
     }
 }
 
@@ -265,36 +416,39 @@ void FlightKinematics::updateMode(const VehicleState &st) {
 // nacelle schedule: slew toward the target, clamped into the conversion corridor
 // ===========================================================================
 float FlightKinematics::scheduleAlpha(float dt, const VehicleState &st, ActuatorCmd &out) {
-    // Airspeed source, with a ground-speed fallback if the pitot is dead.
-    float V      = -1.0f;
-    bool  V_good = false;
-    if (st.airspeed_valid) {
-        V = st.airspeed;  V_good = true;
-    } else if (st.nav_valid) {
-        V = st.ground_speed;  V_good = true;   // no wind correction: conservative
-    }
+    // Speed reference for the corridor. The pitot is the only source that may
+    // justify tilting TOWARD airplane mode. GNSS ground speed is a fallback
+    // for moving back toward hover only: it overstates airspeed in a
+    // tailwind (unsafe for the ceiling) but that only matters when tilting
+    // forward, which the fallback never allows.
+    float V = -1.0f;
+    if (st.airspeed_valid)        V = st.airspeed;
+    else if (st.ground_vel_valid) V = st.ground_speed;
 
-    float step = cfg_.alpha_rate_nominal * dt;
     float want = alpha_target_;
+    if (!st.airspeed_valid) want = fminf(want, alpha_cmd_);
 
-    // With no speed reference at all we cannot corridor-protect. Freeze the
-    // nacelles rather than guess - a frozen tiltrotor still flies, a wrongly
-    // converted one does not.
-    if (!V_good) {
-        out.alpha_min = alpha_cmd_;
-        out.alpha_max = alpha_cmd_;
-        out.corridor_limited = true;
-        return alpha_cmd_;
-    }
-
+    const float step = cfg_.alpha_rate_nominal * dt;
     float a_new = alpha_cmd_;
     if (want > alpha_cmd_)      a_new = fminf(alpha_cmd_ + step, want);
     else if (want < alpha_cmd_) a_new = fmaxf(alpha_cmd_ - step, want);
 
+    if (V < 0.0f) {
+        // No speed reference at all: cannot corridor-protect. Only ever move
+        // toward hover, at the nominal rate - a tiltrotor stuck converted
+        // can't land.
+        out.alpha_min = 0.0f;
+        out.alpha_max = alpha_cmd_;
+        out.corridor_limited = true;
+        alpha_cmd_ = clampf(a_new, 0.0f, kHalfPi);
+        return alpha_cmd_;
+    }
+
     float a_min, a_max;
     corridor(V, st.rho, a_min, a_max);
 
-    const float a_clamped = clampf(a_new, a_min, a_max);
+    float a_clamped = clampf(a_new, a_min, a_max);
+    if (!st.airspeed_valid) a_clamped = fminf(a_clamped, alpha_cmd_);   // floor can't push it forward either
     out.corridor_limited  = (fabsf(a_clamped - a_new) > 1.0e-4f);
     out.alpha_min         = a_min;
     out.alpha_max         = a_max;
@@ -432,10 +586,16 @@ void FlightKinematics::update(float dt, const VehicleState &st, const Setpoints 
 
     updateMode(st);
 
-    if (mode_ == FlightMode::DISARMED || mode_ == FlightMode::FAILSAFE) {
-        pid_rate_roll_.reset();  pid_rate_pitch_.reset();  pid_rate_yaw_.reset();
-        pid_climb_hover_.reset(); pid_climb_fwd_.reset();  pid_speed_fwd_.reset();
+    out.armed     = armed_;
+    out.phase     = phase_;
+    out.fs_reason = fs_reason_;
+
+    if (mode_ == FlightMode::DISARMED) {
+        resetControllers();
         out = ActuatorCmd{};
+        out.armed     = false;
+        out.phase     = phase_;
+        out.fs_reason = fs_reason_;
         out.mode      = mode_;
         out.alpha_cmd = alpha_cmd_;
         out.nacelle_left  = nac_left_prev_;
@@ -444,8 +604,20 @@ void FlightKinematics::update(float dt, const VehicleState &st, const Setpoints 
     }
 
     // ---------------- air data ----------------
-    const float q_dyn = (st.airspeed_valid && st.q_dyn > 0.0f) ? st.q_dyn : 0.0f;
-    const float V     = st.airspeed_valid ? fmaxf(st.airspeed, 0.0f) : 0.0f;
+    // Pitot when valid. If it dies while converted (alpha > 0), fall back to
+    // GNSS ground speed so the aero columns, wing-lift estimate and forward
+    // speed loop don't collapse to zero mid-air - the mode machine is already
+    // taking the aircraft back to hover. In hover w_fwd is ~0 regardless.
+    float V     = 0.0f;
+    float q_dyn = 0.0f;
+    if (st.airspeed_valid) {
+        V     = fmaxf(st.airspeed, 0.0f);
+        q_dyn = fmaxf(st.q_dyn, 0.0f);
+    } else if (st.ground_vel_valid && alpha_cmd_ > 0.05f) {
+        V     = st.ground_speed;
+        q_dyn = 0.5f * st.rho * V * V;
+        out.air_data_synthetic = true;
+    }
 
     // mu: how much authority the control surfaces actually have.
     const float mu = clampf(q_dyn / fmaxf(cfg_.q_ref, 1.0f), 0.0f, 1.0f);
@@ -465,26 +637,103 @@ void FlightKinematics::update(float dt, const VehicleState &st, const Setpoints 
     const float pitch_frm_clmb = pid_climb_fwd_.update(sp.climb_rate_sp, st.climb_rate, dt);
     const float ax_dem_fwd     = pid_speed_fwd_.update(sp.airspeed_sp, V, dt);
 
-    // ---------------- attitude demands ----------------
-    // The stabiliser ALWAYS regulates roll and pitch. The config flags only
-    // decide whether guidance is allowed to command a non-zero attitude in
-    // helicopter mode - "unused DOF" means "not commanded", never "not held".
-    const float lim = cfg_.hover_attitude_limit;
-    const float roll_hover  = cfg_.hover_allow_roll_cmd
-                                ? clampf(sp.roll_sp, -lim, lim) : 0.0f;
-    const float pitch_hover = cfg_.hover_allow_pitch_cmd
-                                ? clampf(sp.pitch_sp, -lim, lim) : 0.0f;
+    // ---------------- guidance cascade (path_active only) ----------------
+    // Nose points along desired_course in every mode - lateral correction in
+    // hover is via roll tilt, not by changing heading (no aim-off there).
+    // Forward mode adds a cross-track-derived aim-off angle on top of
+    // desired_course, single-stage. Hover gets a genuine two-stage cascade
+    // (position error -> velocity setpoint -> tilt) since hover has little
+    // natural damping to lean on.
+    float heading_sp           = sp.desired_course;
+    float roll_hover_guidance  = 0.0f;
+    float pitch_hover_guidance = 0.0f;
 
-    const float roll_fwd  = sp.roll_sp;
+    if (sp.path_active) {
+        const float course_correction = clampf(
+            pid_xtrack_to_course_fwd_.update(0.0f, sp.cross_track_error, dt),
+            -cfg_.max_course_correction, cfg_.max_course_correction);
+        heading_sp = sp.desired_course + w_fwd * course_correction;
+
+        // Path-frame ground velocity from the GNSS velocity VECTOR. Heading
+        // can't stand in for it: heading hold keeps the nose on the course, so
+        // sin(yaw - course) reads ~0 whatever the real sideways drift is.
+        float lateral_vel = 0.0f, along_vel = 0.0f;
+        if (st.ground_vel_valid) {
+            const float rel = st.course_over_ground - sp.desired_course;
+            lateral_vel = st.ground_speed * sinf(rel);   // right of path positive
+            along_vel   = st.ground_speed * cosf(rel);
+        }
+        const float lateral_vel_sp = pid_xtrack_to_latvel_hover_.update(0.0f, sp.cross_track_error, dt);
+
+        roll_hover_guidance = clampf(
+            pid_latvel_to_roll_hover_.update(lateral_vel_sp, lateral_vel, dt),
+            -cfg_.lateral_hold_max_tilt, cfg_.lateral_hold_max_tilt);
+
+        // NOTE the negation: to accelerate FORWARD, the fuselage must pitch
+        // NOSE-DOWN (negative, in this file's nose-up-positive convention) -
+        // that's what tilts the mostly-vertical hover thrust vector forward.
+        // Nacelle tilt isn't available as a separate forward-thrust channel
+        // here since alpha is locked at 0 in HOVER (w_fwd suppresses F_x
+        // until real forward flight) - pitch-based translation, same
+        // mechanism a multicopter uses, is the only channel HOVER mode has.
+        pitch_hover_guidance = -clampf(
+            pid_speed_hover_.update(sp.along_speed_sp, along_vel, dt),
+            -cfg_.lateral_hold_max_tilt, cfg_.lateral_hold_max_tilt);
+
+        out.cross_track_dbg     = sp.cross_track_error;
+        out.lateral_vel_est_dbg = lateral_vel;
+        out.lateral_vel_sp_dbg  = lateral_vel_sp;
+        out.along_vel_est_dbg   = along_vel;
+        out.along_vel_sp_dbg    = sp.along_speed_sp;
+    } else {
+        pid_xtrack_to_course_fwd_.reset();
+        pid_xtrack_to_latvel_hover_.reset();
+        pid_latvel_to_roll_hover_.reset();
+        pid_speed_hover_.reset();
+    }
+
+    // ---------------- attitude demands ----------------
+    // The stabiliser ALWAYS regulates roll and pitch. Outside path-following,
+    // the config flags decide whether guidance/RC may command a non-zero
+    // hover attitude directly - "unused DOF" means "not commanded", never
+    // "not held".
+    const float lim = cfg_.hover_attitude_limit;
+    const float roll_hover  = sp.path_active ? roll_hover_guidance
+                              : (cfg_.hover_allow_roll_cmd ? clampf(sp.roll_sp, -lim, lim) : 0.0f);
+    const float pitch_hover = sp.path_active ? pitch_hover_guidance
+                              : (cfg_.hover_allow_pitch_cmd ? clampf(sp.pitch_sp, -lim, lim) : 0.0f);
+
+    // Heading error, wrapped to [-pi,pi] - a plain PID doesn't know about
+    // angle wraparound, so the wrap happens here, not inside pid_heading_hold_.
+    float yaw_rate_from_heading = sp.yaw_rate_sp;
+    if (sp.path_active) {
+        const float herr = wrapPi(heading_sp - st.yaw);
+        yaw_rate_from_heading = pid_heading_hold_.update(herr, 0.0f, dt);
+        out.heading_error_dbg = herr;
+    } else {
+        pid_heading_hold_.reset();
+    }
+
+    // Forward-mode bank command from the desired turn rate - the inverse of
+    // the coordinated-turn relation psi_dot_fwd already uses below (that one
+    // goes bank->rate for anti-sideslip; this one goes rate->bank to
+    // actually steer toward heading_sp).
+    const float roll_fwd_guidance = clampf(
+        (V > 1.0f) ? atan2f(V * yaw_rate_from_heading, cfg_.g) : 0.0f,
+        -cfg_.max_bank_fwd, cfg_.max_bank_fwd);
+
+    const float roll_fwd  = sp.path_active ? roll_fwd_guidance : sp.roll_sp;
     const float pitch_fwd = clampf(sp.pitch_sp + pitch_frm_clmb, -0.45f, 0.45f);
 
     const float roll_cmd  = lerpf(roll_hover,  roll_fwd,  w_fwd);
     const float pitch_cmd = lerpf(pitch_hover, pitch_fwd, w_fwd);
 
-    // Turn demand: direct in helicopter mode, bank-coordinated in airplane mode.
-    float psi_dot_fwd = sp.yaw_rate_sp;
+    // Turn demand: direct in helicopter mode, bank-coordinated in airplane
+    // mode. yaw_rate_from_heading already stands in for sp.yaw_rate_sp when
+    // path_active (and equals it exactly otherwise).
+    float psi_dot_fwd = yaw_rate_from_heading;
     if (V > 5.0f) psi_dot_fwd = (cfg_.g / V) * tanf(clampf(st.roll, -1.0f, 1.0f));
-    const float psi_dot = lerpf(sp.yaw_rate_sp, psi_dot_fwd, w_fwd);
+    const float psi_dot = lerpf(yaw_rate_from_heading, psi_dot_fwd, w_fwd);
 
     // ---------------- Euler kinematic transform ----------------
     // This is the correct, SIGNED replacement for cos^2/sin^2 bank blending.
@@ -506,7 +755,7 @@ void FlightKinematics::update(float dt, const VehicleState &st, const Setpoints 
     const float rdot = pid_rate_yaw_.update(r_sp, st.r, dt);
 
     // ---------------- objective vector ----------------
-    const float lift_w = wingLift(st);
+    const float lift_w = wingLift(st, V, q_dyn);
 
     float drag_est = q_dyn * cfg_.wing_area * cfg_.CD0;
     if (q_dyn > 1.0f) {
@@ -592,27 +841,103 @@ void FlightKinematics::update(float dt, const VehicleState &st, const Setpoints 
 // for why these particular signs (roll unchanged, pitch/yaw negated).
 // ===========================================================================
 ActuatorCmd FlightKinematics::runCycle(float dt, const RawSensors &raw,
-                                       const Setpoints &sp, VehicleState *out_state) {
-    static const float kDegToRad = 0.017453292f;
+                                       const Setpoints &sp_manual, VehicleState *out_state) {
+    // Estimators get the real elapsed time (clamped against nonsense);
+    // update() applies its own tighter clamp for the PIDs.
+    if (!(dt > 0.0f)) dt = 0.0f;
+    if (dt > 0.5f)    dt = 0.5f;
+    time_s_ += dt;
 
     VehicleState st;
 
     // --- attitude: Fusion's raw NWU -> this module's internal convention ---
     st.roll  =  raw.fusion_roll_deg  * kDegToRad;   // unchanged
     st.pitch = -raw.fusion_pitch_deg * kDegToRad;   // raw nose-down+ -> nose-up+
-    st.yaw   = -raw.fusion_yaw_deg   * kDegToRad;   // raw nose-left+ -> nose-right+
+    st.yaw   = wrapPi(-raw.fusion_yaw_deg * kDegToRad   // raw nose-left+ -> nose-right+
+                      + cfg_.magnetic_declination_rad); // magnetic -> true north
     st.p     =  raw.fusion_gyro_x_dps * kDegToRad;  // unchanged
     st.q     = -raw.fusion_gyro_y_dps * kDegToRad;
     st.r     = -raw.fusion_gyro_z_dps * kDegToRad;
 
-    // --- vertical channel ---
-    st.altitude   = raw.baro_altitude;
-    st.climb_rate = raw.baro_climb_rate;
+    // --- horizontal: GNSS dead-reckoning (also feeds the GNSS climb-rate
+    //     fallback below, so it runs first) ---
+    updateNavEstimate(dt, raw, st);
+
+    // --- vertical channel: baro/GNSS complementary filter ---
+    // Baro's climb_rate drives fast/responsive tracking (P0-bias-immune -
+    // differentiating cancels a near-constant offset). GNSS altitude slowly
+    // calibrates OUT that bias via a separately-tracked estimate
+    // (baro_bias_m_), rather than being applied to fused_altitude_m_
+    // directly - see baro_resync_tau_s's header comment.
+    if (raw.baro_valid) {
+        if (!alt_fusion_primed_) {
+            fused_altitude_m_  = raw.baro_altitude;
+            baro_frame_alt_m_  = raw.baro_altitude;
+            alt_fusion_primed_ = true;
+        } else if (dt > 1.0e-4f) {
+            fused_altitude_m_ += raw.baro_climb_rate * dt;
+            baro_frame_alt_m_ += raw.baro_climb_rate * dt;
+
+            // Fast re-sync toward the BIAS-CORRECTED raw reading (and, for
+            // the baro-only copy, toward the raw reading itself).
+            const float correctedBaro = raw.baro_altitude - baro_bias_m_;
+            const float tauFast   = fmaxf(cfg_.baro_resync_tau_s, 0.1f);
+            const float alphaFast = dt / (tauFast + dt);
+            fused_altitude_m_ += alphaFast * (correctedBaro - fused_altitude_m_);
+            baro_frame_alt_m_ += alphaFast * (raw.baro_altitude - baro_frame_alt_m_);
+
+            if (raw.gnss_fix_valid && st.nav_valid) {
+                // Adapt the BIAS estimate (not fused_altitude_m_ directly)
+                // toward whatever offset currently reconciles raw baro with
+                // GNSS truth - P0 miscalibration, temperature, weather.
+                // Faster on the ground, where it's calibrating before takeoff.
+                const float tauSlow   = fmaxf(armed_ ? cfg_.baro_gnss_fusion_tau_s
+                                                     : cfg_.baro_gnss_fusion_tau_ground_s, 0.1f);
+                const float alphaSlow = dt / (tauSlow + dt);
+                const float impliedBias = raw.baro_altitude - raw.gnss_altitude_m;
+                baro_bias_m_ += alphaSlow * (impliedBias - baro_bias_m_);
+            }
+        }
+    }
+
+    if (raw.baro_valid && raw.gnss_fix_valid && st.nav_valid)
+        gnss_alt_settle_s_ = fminf(gnss_alt_settle_s_ + dt, 1.0e6f);
+    else
+        gnss_alt_settle_s_ = 0.0f;
+
+    // Fallback AGL (no DEM): height above the arming point, measured on the
+    // baro-only smoothed altitude against a reference captured on it at
+    // arm(), so the GNSS bias estimate converging can't shift it. Overridden
+    // below by the DEM clearance when available.
+    if (raw.baro_valid && alt_fusion_primed_) {
+        st.altitude   = fused_altitude_m_;
+        st.climb_rate = raw.baro_climb_rate;
+        st.agl        = ground_ref_set_ ? (baro_frame_alt_m_ - ground_ref_baro_m_) : 0.0f;
+    } else if (raw.gnss_fix_valid && st.nav_valid) {
+        // Barometer lost: GNSS-only vertical channel (noisier, laggier) -
+        // enough for the failsafe descent that updateHealth() will trigger.
+        st.altitude   = raw.gnss_altitude_m;
+        st.climb_rate = gnss_climb_est_.rate();
+        st.agl        = ground_ref_set_ ? (raw.gnss_altitude_m - (ground_ref_baro_m_ - baro_bias_m_)) : 0.0f;
+    } else {
+        st.altitude   = fused_altitude_m_;
+        st.climb_rate = 0.0f;
+        st.agl        = ground_ref_set_ ? (baro_frame_alt_m_ - ground_ref_baro_m_) : 0.0f;
+    }
+
+    // DEM clearance: MSL altitude minus the highest terrain under the vehicle
+    // and along the look-ahead. Both are absolute (GNSS-calibrated MSL, DEM
+    // MSL), so nothing depends on where the vehicle was armed.
+    if (raw.terrain_valid) {
+        st.terrain_valid  = true;
+        st.terrain_elev_m = raw.terrain_elev_m;
+        st.agl            = st.altitude - raw.terrain_elev_m;
+    }
 
     // Air density from the ideal gas law using real pressure/temperature
-    // instead of a fixed 1.225 - matters once the pitot is live, since
-    // dynamic-pressure-derived airspeed and the expectedDynamicPressure()
-    // drag balance both scale with it.
+    // instead of a fixed 1.225 - dynamic-pressure-derived airspeed and the
+    // corridor both scale with it. 1000 Pa = 10 hPa is a sensor-alive sanity
+    // floor, not a physical-altitude gate.
     if (raw.baro_valid && raw.baro_pressure_pa > 1000.0f) {
         const float T_kelvin = raw.baro_temperature_c + 273.15f;
         const float R_specific_air = 287.05f;  // J/(kg*K), dry air
@@ -621,23 +946,312 @@ ActuatorCmd FlightKinematics::runCycle(float dt, const RawSensors &raw,
         st.rho = 1.225f;  // ISA sea-level fallback if baro isn't reporting
     }
 
-    // --- navigation ---
-    // Deliberately gated on `nav_ready` (from guidance/F-Code), NOT on raw
-    // GPS fix quality - see the RawSensors comment for why.
-    st.nav_valid      = raw.nav_ready;
-    st.distance_to_go = raw.distance_to_go;
-    st.ground_speed   = raw.gnss_ground_speed;
+    // --- air data: pitot differential pressure -> true airspeed ---
+    st.airspeed_valid = raw.pitot_valid;
+    st.q_dyn          = raw.pitot_valid ? fmaxf(raw.pitot_q_pa, 0.0f) : 0.0f;
+    st.airspeed       = raw.pitot_valid ? sqrtf(2.0f * st.q_dyn / st.rho) : 0.0f;
 
-    // --- air data ---
-    st.airspeed_valid = raw.airspeed_valid;
-    st.airspeed        = raw.airspeed;
-    st.q_dyn            = raw.q_dyn;
+    // --- sensor health -> failsafe ---
+    updateHealth(dt, raw);
+
+    // --- guidance: failsafe > mission > manual ---
+    Setpoints sp = sp_manual;
+    if (armed_) {
+        if (failsafe_)                          sp = runFailsafeGuidance(dt, st);
+        else if (phase_ != MissionPhase::NONE)  sp = runMissionGuidance(dt, st);
+        // runMissionGuidance may itself latch a failsafe (NAV_LOST); it takes
+        // effect next cycle.
+    }
 
     ActuatorCmd out;
     update(dt, st, sp, out);
 
+    // --- touchdown detection (only while a landing descent is commanded) ---
+    // On the ground the climb-rate loop keeps asking for -descent_rate, sees
+    // ~0, and winds thrust down - so "not moving vertically AND asking for
+    // well under hover thrust" only happens after touchdown. Except right at
+    // the start of the descent, before the slow baro climb-rate estimate has
+    // caught up - hence land_detect_delay_s.
+    if (armed_ && sp.descending) {
+        descend_time_s_ += dt;
+        const bool still      = fabsf(st.climb_rate) < 0.3f;
+        const bool low_thrust = out.v_demand[V_FUP] < 0.7f * cfg_.mass * cfg_.g;
+        const bool armed_det  = descend_time_s_ > cfg_.land_detect_delay_s;
+        landed_timer_s_ = (armed_det && still && low_thrust) ? landed_timer_s_ + dt : 0.0f;
+        if (landed_timer_s_ >= cfg_.landed_confirm_s) {
+            disarm();
+            update(dt, st, sp, out);   // emit disarmed outputs this very cycle
+        }
+    } else {
+        landed_timer_s_ = 0.0f;
+        descend_time_s_ = 0.0f;
+    }
+
+    last_raw_  = raw;
+    last_st_   = st;
+    have_last_ = true;
+
     if (out_state) *out_state = st;
     return out;
+}
+
+// ===========================================================================
+// updateNavEstimate - GNSS position, dead-reckoned between fixes.
+//
+// GNSS only reports a genuinely NEW fix at ~1 Hz (gnss_fix_seq changes), but
+// this runs every 100 Hz cycle. The estimate is extrapolated every cycle
+// with the GNSS velocity VECTOR (speed + course over ground from RMC) - not
+// the nose heading, which differs from the direction of travel whenever the
+// aircraft crabs into wind or drifts in hover, and is magnetic - then pulled
+// toward each fresh fix using the ACTUAL interval since the previous one.
+// ===========================================================================
+void FlightKinematics::updateNavEstimate(float dt, const RawSensors &raw, VehicleState &st) {
+    // --- velocity (RMC) ---
+    const bool newVel = raw.gnss_vel_valid && (raw.gnss_vel_seq != last_vel_seq_seen_);
+    if (newVel) {
+        last_vel_seq_seen_ = raw.gnss_vel_seq;
+        time_since_vel_s_  = 0.0f;
+        gnss_speed_        = raw.gnss_ground_speed;
+        gnss_course_       = raw.gnss_course_rad;
+        gnss_vel_have_     = true;
+    } else {
+        time_since_vel_s_ += dt;
+    }
+    const bool vel_ok = gnss_vel_have_ && (time_since_vel_s_ < cfg_.gnss_fix_stale_timeout_s);
+    st.ground_vel_valid   = vel_ok;
+    st.ground_speed       = vel_ok ? gnss_speed_ : 0.0f;
+    st.course_over_ground = gnss_course_;
+    const float vx = vel_ok ? gnss_speed_ * sinf(gnss_course_) : 0.0f;   // east
+    const float vy = vel_ok ? gnss_speed_ * cosf(gnss_course_) : 0.0f;   // north
+
+    // --- position (GGA) ---
+    const bool  newFix       = raw.gnss_fix_valid && (raw.gnss_fix_seq != last_gnss_seq_seen_);
+    const float fix_interval = time_since_fix_s_;   // gap since the PREVIOUS new fix
+    if (newFix) {
+        last_gnss_seq_seen_ = raw.gnss_fix_seq;
+        time_since_fix_s_   = 0.0f;
+        // Vertical fallback, sampled at the fix rate (see RateEstimator).
+        gnss_climb_est_.update(raw.gnss_altitude_m, fmaxf(fix_interval, 0.01f));
+        // No mission: anchor the local frame at the first fix so positions
+        // stay small (float precision) for failsafe position hold.
+        if (!fcode::hasOrigin()) fcode::setOrigin(raw.gnss_lat_deg, raw.gnss_lon_deg);
+    } else {
+        time_since_fix_s_ += dt;
+    }
+
+    if (!pos_est_primed_) {
+        if (newFix) {
+            fcode::gpsToLocal(raw.gnss_lat_deg, raw.gnss_lon_deg, pos_est_x_m_, pos_est_y_m_);
+            pos_est_primed_ = true;
+        }
+    } else {
+        pos_est_x_m_ += vx * dt;
+        pos_est_y_m_ += vy * dt;
+
+        if (newFix) {
+            float rawX, rawY;
+            fcode::gpsToLocal(raw.gnss_lat_deg, raw.gnss_lon_deg, rawX, rawY);
+            // Bounded pull toward the fresh fix, not a snap - a single noisy
+            // fix shouldn't jerk the estimate.
+            const float tau   = fmaxf(cfg_.gnss_position_correction_tau_s, 0.01f);
+            const float alpha = 1.0f - expf(-fmaxf(fix_interval, 0.01f) / tau);
+            pos_est_x_m_ += alpha * (rawX - pos_est_x_m_);
+            pos_est_y_m_ += alpha * (rawY - pos_est_y_m_);
+        }
+    }
+
+    if (time_since_fix_s_ > cfg_.gnss_fix_stale_timeout_s) {
+        // GPS genuinely unavailable (not just between normal ~1Hz updates) -
+        // stop trusting the dead-reckoned estimate; re-prime cleanly on the
+        // next good fix rather than quietly drifting further on stale data.
+        pos_est_primed_ = false;
+    }
+
+    st.nav_valid = pos_est_primed_;
+    st.pos_x     = pos_est_x_m_;
+    st.pos_y     = pos_est_y_m_;
+}
+
+// ===========================================================================
+// updateHealth - sensor loss while armed -> latched FAILSAFE (land).
+// ===========================================================================
+void FlightKinematics::updateHealth(float dt, const RawSensors &raw) {
+    if (!armed_) {
+        imu_bad_s_  = 0.0f;
+        baro_bad_s_ = 0.0f;
+        return;
+    }
+    imu_bad_s_  = raw.imu_valid  ? 0.0f : imu_bad_s_  + dt;
+    baro_bad_s_ = raw.baro_valid ? 0.0f : baro_bad_s_ + dt;
+    if (imu_bad_s_  > cfg_.imu_fail_timeout_s)  requestFailsafe(FailsafeReason::IMU);
+    if (baro_bad_s_ > cfg_.baro_fail_timeout_s) requestFailsafe(FailsafeReason::BARO);
+}
+
+// ===========================================================================
+// guidance helpers
+// ===========================================================================
+float FlightKinematics::clearanceHold(float target_agl, const VehicleState &st, float dt) {
+    last_target_agl_ = target_agl;
+    if (st.terrain_valid) {
+        if (alt_ref_msl_) { pid_altitude_hold_.reset(); alt_ref_msl_ = false; }
+        terrain_lost_s_ = 0.0f;
+        return pid_altitude_hold_.update(target_agl, st.agl, dt);
+    }
+    // No DEM for this position: hold the MSL altitude we had. The PID is
+    // reset on the switch - its derivative-on-measurement would otherwise
+    // see the measurement jump from ~clearance to ~MSL and kick.
+    if (!alt_ref_msl_) {
+        pid_altitude_hold_.reset();
+        msl_hold_m_  = st.altitude;
+        alt_ref_msl_ = true;
+    }
+    if (st.nav_valid) {   // with GNSS lost as well, NAV_LOST governs instead
+        terrain_lost_s_ += dt;
+        if (terrain_lost_s_ > cfg_.terrain_loss_land_timeout_s) requestFailsafe(FailsafeReason::TERRAIN);
+    }
+    return pid_altitude_hold_.update(msl_hold_m_, st.altitude, dt);
+}
+
+// Hold a point: path frame is the line through (hold_x, hold_y) along
+// `course`, so the same hover cascade that follows paths also parks the
+// aircraft - cross-track -> roll, signed along-track error -> velocity -> pitch.
+void FlightKinematics::pointHold(const VehicleState &st, float hold_x, float hold_y,
+                                 float course, Setpoints &sp) const {
+    const float ux = sinf(course), uy = cosf(course);
+    const float along_to_go = ux * (hold_x - st.pos_x) + uy * (hold_y - st.pos_y);
+    const float cross       = uy * (st.pos_x - hold_x) - ux * (st.pos_y - hold_y);
+    sp.path_active       = true;
+    sp.desired_course    = course;
+    sp.cross_track_error = cross;
+    sp.along_speed_sp    = clampf(cfg_.point_hold_gain * along_to_go,
+                                  -cfg_.point_hold_max_speed, cfg_.point_hold_max_speed);
+}
+
+// ===========================================================================
+// runMissionGuidance - mission lifecycle TAKEOFF -> ENROUTE -> LAND, plus the
+// altitude hold that turns F43's ground_clearance_m into climb_rate_sp.
+// Fills st.distance_to_go / st.mission_distance_to_go for the mode machine.
+// ===========================================================================
+Setpoints FlightKinematics::runMissionGuidance(float dt, VehicleState &st) {
+    Setpoints sp{};   // path_active false: wings level, hold heading - the
+                      // safe default if anything below bails early
+    sp.airspeed_sp = (mode_ == FlightMode::TRANS_BACK) ? cfg_.v_max_hover : cfg_.cruise_airspeed;
+
+    if (!st.nav_valid) {
+        // GNSS lost: the mode machine is already heading back to hover. Hold
+        // wings level and altitude, and wait for the fix to come back - land
+        // if it doesn't.
+        nav_lost_s_ += dt;
+        if (nav_lost_s_ > cfg_.nav_loss_land_timeout_s) requestFailsafe(FailsafeReason::NAV_LOST);
+        if (phase_ == MissionPhase::LAND && land_descending_) {
+            sp.climb_rate_sp = -cfg_.land_descent_rate;
+            sp.descending    = true;
+        } else {
+            sp.climb_rate_sp = clearanceHold(last_target_agl_, st, dt);
+        }
+        return sp;
+    }
+    nav_lost_s_ = 0.0f;
+
+    fcode::NavOutput nav;
+    fcode::update(st.pos_x, st.pos_y, nav);
+    st.distance_to_go         = nav.distance_to_go;
+    st.mission_distance_to_go = nav.mission_distance_to_go;
+    const float clearance     = nav.ground_clearance_m;
+
+    switch (phase_) {
+        case MissionPhase::TAKEOFF:
+            // Vertical climb over the arming point, nose along the first leg -
+            // don't start translating low over the ground.
+            if (!takeoff_hold_set_) {
+                hold_x_ = st.pos_x;
+                hold_y_ = st.pos_y;
+                hold_course_ = nav.desired_course_rad;
+                takeoff_hold_set_ = true;
+            }
+            pointHold(st, hold_x_, hold_y_, hold_course_, sp);
+            sp.climb_rate_sp = clearanceHold(clearance, st, dt);
+            if (st.terrain_valid && st.agl >= cfg_.takeoff_complete_fraction * clearance)
+                phase_ = MissionPhase::ENROUTE;
+            break;
+
+        case MissionPhase::ENROUTE:
+            sp.path_active       = true;
+            sp.desired_course    = nav.desired_course_rad;
+            sp.cross_track_error = nav.cross_track_error;
+            // Cruise, tapering as sqrt(2*a*d) into the FINAL point only -
+            // intermediate segment ends are flown through.
+            sp.along_speed_sp = fminf(cfg_.cruise_ground_speed_hover,
+                                      sqrtf(2.0f * cfg_.approach_decel *
+                                            fmaxf(nav.mission_distance_to_go, 0.0f)));
+            sp.climb_rate_sp = clearanceHold(clearance, st, dt);
+            if (nav.mission_complete) {
+                phase_           = MissionPhase::LAND;
+                land_descending_ = false;
+                land_timer_s_    = 0.0f;
+            }
+            break;
+
+        case MissionPhase::LAND: {
+            // Hold over the final point; descend once back in hover and
+            // settled (or after a timeout, e.g. in gusty wind).
+            sp.path_active       = true;
+            sp.desired_course    = nav.desired_course_rad;
+            sp.cross_track_error = nav.cross_track_error;
+            sp.along_speed_sp    = clampf(cfg_.point_hold_gain * nav.mission_distance_to_go,
+                                          -cfg_.point_hold_max_speed, cfg_.point_hold_max_speed);
+            land_timer_s_ += dt;
+            if (!land_descending_) {
+                const bool settled = (mode_ == FlightMode::HOVER) && (alpha_cmd_ < 0.03f) &&
+                                     fabsf(nav.mission_distance_to_go) < cfg_.land_settle_radius_m &&
+                                     fabsf(nav.cross_track_error)      < cfg_.land_settle_radius_m &&
+                                     st.ground_speed < 1.0f;
+                if (settled || land_timer_s_ > cfg_.land_settle_timeout_s) land_descending_ = true;
+            }
+            if (land_descending_) {
+                sp.climb_rate_sp = -cfg_.land_descent_rate;
+                sp.descending    = true;
+            } else {
+                sp.climb_rate_sp = clearanceHold(clearance, st, dt);
+            }
+            break;
+        }
+
+        case MissionPhase::NONE:
+            break;
+    }
+
+    return sp;
+}
+
+// ===========================================================================
+// runFailsafeGuidance - controlled landing where we are. Converting back to
+// hover is the mode machine's job (FAILSAFE targets alpha = 0); this only
+// decides attitude and the vertical channel.
+// ===========================================================================
+Setpoints FlightKinematics::runFailsafeGuidance(float dt, const VehicleState &st) {
+    (void)dt;
+    Setpoints sp{};                        // wings level, zero yaw rate
+    sp.airspeed_sp = cfg_.v_max_hover;     // decelerate if still converted
+
+    const bool converted_back = (alpha_cmd_ < 0.03f);
+    if (!converted_back) {
+        sp.climb_rate_sp = 0.0f;           // hold altitude while converting
+        return sp;
+    }
+
+    if (st.nav_valid) {
+        if (!fs_hold_set_) {
+            hold_x_      = st.pos_x;
+            hold_y_      = st.pos_y;
+            hold_course_ = st.yaw;
+            fs_hold_set_ = true;
+        }
+        pointHold(st, hold_x_, hold_y_, hold_course_, sp);
+    }
+    sp.climb_rate_sp = -cfg_.land_descent_rate;
+    sp.descending    = true;
+    return sp;
 }
 
 }  // namespace raven

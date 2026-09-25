@@ -63,12 +63,15 @@ void setMPU(const uint8_t DLPF, const uint8_t FS_SEL, const uint8_t AFS_SEL) {
 
 // usage setMPU(setMPU_DLPF(MPU_DLPF_2), setGyroFS(MPU_GYRO_FS_250), setAccFS(MPU_ACCEL_FS_2))
 
-void readMag(D3 &magbuffer) {
+bool readMag(D3 &magbuffer) {
     static D3_int mag_raw;
-    I2C_IO::read_IIC(MAG_ADDRESS, MAG_OUTPUT_REG, 3, (int16_t*)&mag_raw, true);
+    if (!I2C_IO::read_IIC(MAG_ADDRESS, MAG_OUTPUT_REG, 3, (int16_t*)&mag_raw, true)) return false;
+    // HMC5883L reports -4096 on an axis whose ADC overflowed - not a usable sample.
+    if (mag_raw.x == MAG_OVERFLOW || mag_raw.y == MAG_OVERFLOW || mag_raw.z == MAG_OVERFLOW) return false;
     magbuffer.x = static_cast<float>(mag_raw.x) * 0.73f;    // convert to miliGauss, saturation occurs when -2989 is reported.
     magbuffer.y = static_cast<float>(mag_raw.z) * 0.73f;
     magbuffer.z = static_cast<float>(mag_raw.y) * 0.73f;
+    return true;
 }
 //  usage readMag(mag)
 
@@ -86,9 +89,9 @@ void applyMagCalibration(const D3 &magt, D3 &magCalibrated) {
     magCalibrated.z = (-0.054459f * tempX) + (0.014806f * tempY) + (0.963926f * tempZ);
 }
 
-void readMPU(D3 &accbuffer, D3 &gyrobuffer) {
+bool readMPU(D3 &accbuffer, D3 &gyrobuffer) {
     static MPU_output mpudata;
-    I2C_IO::read_IIC(MPU_ADDRESS, MPU_OUTPUT_REG, 7, (int16_t*)&mpudata, true);
+    if (!I2C_IO::read_IIC(MPU_ADDRESS, MPU_OUTPUT_REG, 7, (int16_t*)&mpudata, true)) return false;
     accbuffer.x = (static_cast<float>(mpudata.ax) * 0.000001f) * 61.035156f;
     accbuffer.y = (static_cast<float>(mpudata.ay) * 0.000001f) * 61.035156f;
     accbuffer.z = (static_cast<float>(mpudata.az) * 0.000001f) * 61.035156f;
@@ -96,6 +99,7 @@ void readMPU(D3 &accbuffer, D3 &gyrobuffer) {
     gyrobuffer.x = (static_cast<float>(mpudata.gx) * 0.001f) * 7.633588f;
     gyrobuffer.y = (static_cast<float>(mpudata.gy) * 0.001f) * 7.633588f;
     gyrobuffer.z = (static_cast<float>(mpudata.gz) * 0.001f) * 7.633588f;
+    return true;
 }
 //  usage readMPU(accel, gyro)
 
@@ -109,21 +113,26 @@ void applyAccelCalibration(const D3 &accelt, D3 &accelCalibrated) {
     accelCalibrated.z = (-0.002850f * tempX) + (-0.002416f * tempY) + (0.984773f * tempZ);
 }
 
-void measureGyroOffset(D3 &accelt, D3 &gyrot, D3 &gyroOffsetTemp){
+bool measureGyroOffset(D3 &accelt, D3 &gyrot, D3 &gyroOffsetTemp){
     double tempX = 0.0;
     double tempY = 0.0;
     double tempZ = 0.0;
 
+    int good = 0;
     for (int i = 0; i < 2000; i++) {
-        readMPU(accelt, gyrot);
-        tempX += gyrot.x;
-        tempY += gyrot.y;
-        tempZ += gyrot.z;
+        if (readMPU(accelt, gyrot)) {
+            tempX += gyrot.x;
+            tempY += gyrot.y;
+            tempZ += gyrot.z;
+            good++;
+        }
         delay(2); 
     }
-    gyroOffsetTemp.x = tempX / 2000.0;
-    gyroOffsetTemp.y = tempY / 2000.0;
-    gyroOffsetTemp.z = tempZ / 2000.0;
+    if (good == 0) return false;
+    gyroOffsetTemp.x = tempX / good;
+    gyroOffsetTemp.y = tempY / good;
+    gyroOffsetTemp.z = tempZ / good;
+    return true;
 }
 // usage measureGyroOffset(accel, gyro, gyroOffset)
 

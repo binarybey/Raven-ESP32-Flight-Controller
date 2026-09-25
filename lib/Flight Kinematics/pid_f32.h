@@ -7,11 +7,10 @@
 // Features:
 //   - derivative on measurement (no setpoint-step kick)
 //   - first-order low-pass on the derivative term
-//   - conditional integration + back-calculation anti-windup
+//   - anti-windup by conditional integration: the integrator freezes while
+//     the output is saturated and the error pushes further into the stop,
+//     plus an absolute clamp (i_limit). There is no back-calculation term.
 //   - explicit output clamp
-//
-// If you already have a PID class in lib/, delete this file and adapt the
-// three call sites in flight_kinematics.cpp.
 
 #pragma once
 

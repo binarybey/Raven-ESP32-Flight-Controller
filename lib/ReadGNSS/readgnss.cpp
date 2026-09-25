@@ -1,216 +1,161 @@
 #include "readgnss.h"
+#include "nmea_parse.h"
 #include <string.h>
-#include <stdlib.h>
 
 HardwareSerial GNSS(GNSS_SERIAL_PORT);
 
 GNSSData masterGNSSData;
 SatelliteData masterSatellites[MAX_SATELLITES];
+volatile uint32_t nmeaChecksumErrors = 0;
 
-enum NMEA_State { WAIT_DOLLAR, READ_HEADER, READ_PAYLOAD };
+void beginGNSS() {
+    GNSS.setRxBufferSize(1024);   // must precede begin()
+    GNSS.begin(GNSS_BAUD, SERIAL_8N1, GNSS_RX_PIN, GNSS_TX_PIN);
+    GNSS.setTimeout(10);
+}
+
+// Publishes one parsed sentence. Returns true for an accepted GGA.
+static bool publish(const nmea::Sentence &s) {
+    static SatelliteData tempSatellites[MAX_SATELLITES];
+    static byte tempVisible = 0;
+
+    if (s.type == nmea::Type::GGA) {
+        const nmea::Gga &g = s.gga;
+        if (xSemaphoreTake(gnssMutex, pdMS_TO_TICKS(5)) != pdTRUE) return false;
+        GNSSData &d = masterGNSSData;
+        d.time_Hours = g.hour; d.time_Minutes = g.minute; d.time_Seconds = g.second;
+        d.fixQuality = g.fix_quality;
+        d.satellite_number_active = g.sats_used;
+        d.HDOP = g.hdop;
+        if (g.fix_quality > 0) {
+            d.latitude_deg  = g.lat.deg;
+            d.longitude_deg = g.lon.deg;
+            d.latitude_Degrees  = g.lat.d; d.latitude_Minutes  = g.lat.m;
+            d.latitude_Seconds  = g.lat.s; d.latitude_Direction  = g.lat.hemi;
+            d.longitude_Degrees = g.lon.d; d.longitude_Minutes = g.lon.m;
+            d.longitude_Seconds = g.lon.s; d.longitude_Direction = g.lon.hemi;
+            d.true_Altitude = g.altitude_msl_m;
+        }
+        d.fixSeq++;
+        d.fixMillis = millis();
+        xSemaphoreGive(gnssMutex);
+        return true;
+    }
+
+    if (s.type == nmea::Type::RMC) {
+        const nmea::Rmc &r = s.rmc;
+        if (xSemaphoreTake(gnssMutex, pdMS_TO_TICKS(5)) != pdTRUE) return false;
+        GNSSData &d = masterGNSSData;
+        if (r.day != 0) { d.time_Day = r.day; d.time_Month = r.month; d.time_Year = r.year; }
+        d.rmcValid       = r.active;
+        d.ground_Speed   = r.speed_knots;
+        d.courseValid    = r.has_course;
+        d.course_Degrees = r.course_deg;
+        d.velSeq++;
+        d.velMillis = millis();
+        xSemaphoreGive(gnssMutex);
+        return false;
+    }
+
+    // GSV: GPS satellites only (GPGSV) - other constellations number their
+    // own GSV groups from 1, and mixing them would scramble the list.
+    if (s.type == nmea::Type::GSV && s.talker[0] == 'G' && s.talker[1] == 'P') {
+        const nmea::Gsv &v = s.gsv;
+        if (v.msg_num == 1) {
+            memset(tempSatellites, 0, sizeof(tempSatellites));
+        }
+        tempVisible = v.sats_in_view;
+        for (int k = 0; k < v.count; ++k) {
+            const int idx = (v.msg_num - 1) * 4 + k;
+            if (idx >= MAX_SATELLITES) break;
+            tempSatellites[idx].satelliteID = v.sats[k].id;
+            tempSatellites[idx].elevation   = v.sats[k].elevation;
+            tempSatellites[idx].azimuth     = v.sats[k].azimuth;
+            tempSatellites[idx].SNR         = v.sats[k].snr;
+        }
+        if (v.msg_num == v.total_msgs &&
+            xSemaphoreTake(gnssMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            memcpy(masterSatellites, tempSatellites, sizeof(tempSatellites));
+            masterGNSSData.satellite_number_visible = tempVisible;
+            xSemaphoreGive(gnssMutex);
+        }
+    }
+    return false;
+}
 
 bool readNMEA(HardwareSerial* GNSS) {
-    static NMEA_State currentState = WAIT_DOLLAR;
-    static char buffer[30]; 
-    static int charIndex = 0;
-    static int fieldIndex = 0;
-    static int sentenceType = 0; // 1=GPRMC, 2=GPGGA, 3=GPGSV
-    
-    static GNSSData tempGNSSData; 
-    static SatelliteData tempSatellites[MAX_SATELLITES];
+    static char line[100];
+    static int  n = 0;
+    static bool inSentence = false;
 
-    static int gsvTotalMessages = 1;
-    static int gsvMessageNum = 1;
-    
     bool newFixAvailable = false;
 
     while (GNSS->available() > 0) {
-        char c = GNSS->read();
+        const char c = GNSS->read();
 
-        switch (currentState) {
-            
-            case WAIT_DOLLAR:
-                if (c == '$') {
-                    charIndex = 0;
-                    sentenceType = 0;
-                    currentState = READ_HEADER;
-                }
-                break;
-
-            case READ_HEADER:
-                if (c == ',') {
-                    buffer[charIndex] = '\0';
-                    fieldIndex = 1; // First data field is index 1
-                    
-                    if (strcmp(buffer, "GPRMC") == 0) sentenceType = 1;
-                    else if (strcmp(buffer, "GPGGA") == 0) sentenceType = 2;
-                    else if (strcmp(buffer, "GPGSV") == 0) sentenceType = 3;
-                    else currentState = WAIT_DOLLAR; // Ignore other sentences
-                    
-                    if (sentenceType != 0) {
-                        charIndex = 0;
-                        currentState = READ_PAYLOAD;
-                    }
-                } else if (charIndex < 6) {
-                    buffer[charIndex++] = c;
-                } else {
-                    currentState = WAIT_DOLLAR; 
-                }
-                break;
-
-            case READ_PAYLOAD:
-                if (c == ',' || c == '*') {
-                    buffer[charIndex] = '\0'; 
-                    
-                    if (sentenceType == 1 && charIndex > 0) { 
-                        if (fieldIndex == 1 && charIndex >= 6) { // Time
-                            char temp[3] = {0};
-                            strncpy(temp, &buffer[0], 2); tempGNSSData.time_Hours = atoi(temp);
-                            strncpy(temp, &buffer[2], 2); tempGNSSData.time_Minutes = atoi(temp);
-                            strncpy(temp, &buffer[4], 2); tempGNSSData.time_Seconds = atoi(temp);
-                        }
-                        else if (fieldIndex == 3 && charIndex >= 9) { // Latitude
-                            char temp[6] = {0};
-                            strncpy(temp, &buffer[0], 2); tempGNSSData.latitude_Degrees = atoi(temp);
-                            strncpy(temp, &buffer[2], 2); tempGNSSData.latitude_Minutes = atoi(temp);
-                            // Skip the decimal at buffer[4] and grab the next 5 digits
-                            strncpy(temp, &buffer[5], 5); tempGNSSData.latitude_Seconds = atof(temp) * 0.0006f;
-                        }
-                        else if (fieldIndex == 4) { // Lat Direction
-                            tempGNSSData.latitude_Direction = buffer[0];
-                        }
-                        else if (fieldIndex == 5 && charIndex >= 10) { // Longitude
-                            char temp[6] = {0};
-                            strncpy(temp, &buffer[0], 3); tempGNSSData.longitude_Degrees = atoi(temp);
-                            strncpy(temp, &buffer[3], 2); tempGNSSData.longitude_Minutes = atoi(temp);
-                            // Skip the decimal at buffer[5] and grab the next 5 digits
-                            strncpy(temp, &buffer[6], 5); tempGNSSData.longitude_Seconds = atof(temp) * 0.0006f;
-                        }
-                        else if (fieldIndex == 6) { // Lon Direction
-                            tempGNSSData.longitude_Direction = buffer[0];
-                        }
-                        else if (fieldIndex == 9 && charIndex >= 6) { // Date
-                            char temp[3] = {0};
-                            strncpy(temp, &buffer[0], 2); tempGNSSData.time_Day = atoi(temp);
-                            strncpy(temp, &buffer[2], 2); tempGNSSData.time_Month = atoi(temp);
-                            strncpy(temp, &buffer[4], 2); tempGNSSData.time_Year = atoi(temp);
-                        }
-                    }
-                    
-                    else if (sentenceType == 2 && charIndex > 0) { 
-                        if (fieldIndex == 6) { // Fix Quality
-                            tempGNSSData.fixQuality = atoi(buffer);
-                        }
-                        else if (fieldIndex == 7) { // Active Sats
-                            tempGNSSData.satellite_number_active = atoi(buffer);
-                        }
-                        else if (fieldIndex == 8) { // HDOP
-                            tempGNSSData.HDOP = atof(buffer);
-                        }
-                        else if (fieldIndex == 9) { // Altitude (Standardized to atof)
-                            tempGNSSData.true_Altitude = atof(buffer);
-                        }
-                    }
-
-                    else if (sentenceType == 3) {
-                        if (fieldIndex == 1 && charIndex > 0) {
-                            gsvTotalMessages = atoi(buffer);
-                        }
-                        else if (fieldIndex == 2 && charIndex > 0) {
-                            gsvMessageNum = atoi(buffer);
-
-                            if (gsvMessageNum == 1) {
-                                memset(tempSatellites, 0, sizeof(tempSatellites));
-                            }
-                        }
-                        else if (fieldIndex == 3 && charIndex > 0) {
-                            tempGNSSData.satellite_number_visible = atoi(buffer);
-                        }
-                        else if (fieldIndex >= 4) {
-                            int satBlock = (fieldIndex - 4) / 4; // 0, 1, 2, or 3 (up to 4 sats per message)
-                            int property = (fieldIndex - 4) % 4; // 0=ID, 1=Elev, 2=Azim, 3=SNR
-                            
-                            int targetIndex = ((gsvMessageNum - 1) * 4) + satBlock;
-                            
-                            if (targetIndex < MAX_SATELLITES && charIndex > 0) {
-                                if (property == 0) tempSatellites[targetIndex].satelliteID = atoi(buffer);
-                                else if (property == 1) tempSatellites[targetIndex].elevation = atoi(buffer);
-                                else if (property == 2) tempSatellites[targetIndex].azimuth = atoi(buffer);
-                                else if (property == 3) tempSatellites[targetIndex].SNR = atoi(buffer);
-                            }
-                        }
-                    }
-
-                    charIndex = 0; 
-                    fieldIndex++;
-
-                    if (c == '*') { 
-                        currentState = WAIT_DOLLAR;
-
-                        if (sentenceType == 2) {
-                            if (xSemaphoreTake(gnssMutex, 0) == pdTRUE) {
-                                masterGNSSData = tempGNSSData;
-                                xSemaphoreGive(gnssMutex);
-                                newFixAvailable = true; 
-                            }
-                        }
-
-                        if (sentenceType == 3 && gsvMessageNum == gsvTotalMessages) {
-                            if (xSemaphoreTake(gnssMutex, 0) == pdTRUE) {
-                                memcpy(masterSatellites, tempSatellites, sizeof(tempSatellites));
-                                xSemaphoreGive(gnssMutex);
-                            }
-                        }
-                    }
-                } else if (charIndex < 29) {
-                    buffer[charIndex++] = c;
-                }
-                break;
+        if (c == '$') {                 // start of a sentence (resyncs on garbage)
+            inSentence = true;
+            n = 0;
+            continue;
         }
+        if (!inSentence) continue;
+
+        if (c == '\r' || c == '\n') {
+            inSentence = false;
+            line[n] = '\0';
+            nmea::Sentence s;
+            const nmea::Result r = nmea::parse(line, s);
+            if (r == nmea::Result::OK) {
+                if (publish(s)) newFixAvailable = true;
+            } else if (r == nmea::Result::BAD_CHECKSUM || r == nmea::Result::MALFORMED) {
+                nmeaChecksumErrors = nmeaChecksumErrors + 1;
+            }
+            continue;
+        }
+
+        if (n < (int)sizeof(line) - 1) line[n++] = c;
+        else inSentence = false;        // overlong: drop it, wait for the next '$'
     }
     return newFixAvailable;
 }
 
 void printGNSS(){
-    if (xSemaphoreTake(gnssMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
-        
-        Serial.println("====== GNSS TELEMETRY ======");
-        
-        // 2. Print Time and Date using %02d to force leading zeros
-        Serial.printf("Time: %02d:%02d:%02d | Date: %02d/%02d/%02d\n", 
-            masterGNSSData.time_Hours, masterGNSSData.time_Minutes, masterGNSSData.time_Seconds,
-            masterGNSSData.time_Day, masterGNSSData.time_Month, masterGNSSData.time_Year);
-            
-        // 3. Print Coordinates using %d for bytes/ints, %f for floats, %c for chars
-        Serial.printf("Lat: %d deg %d min %.4f sec %c\n",
-            masterGNSSData.latitude_Degrees, masterGNSSData.latitude_Minutes, 
-            masterGNSSData.latitude_Seconds, masterGNSSData.latitude_Direction);
-            
-        Serial.printf("Lon: %d deg %d min %.4f sec %c\n",
-            masterGNSSData.longitude_Degrees, masterGNSSData.longitude_Minutes, 
-            masterGNSSData.longitude_Seconds, masterGNSSData.longitude_Direction);
-            
-        // 4. Print Fix and Altitude
-        Serial.printf("Fix: %d | Sats: %d | HDOP: %.2f | Alt: %.1fm\n",
-            masterGNSSData.fixQuality, masterGNSSData.satellite_number_visible, 
-            masterGNSSData.HDOP, masterGNSSData.true_Altitude);
-            
-        // 5. Loop through the array of structs for the satellites
-        int active = masterGNSSData.satellite_number_visible;
-        if (active > MAX_SATELLITES) active = MAX_SATELLITES;
-        
-        Serial.println("--- Visible Satellites ---");
-        for (int i = 0; i < active; i++) {
-            // Only print if the ID is valid
-            if (masterSatellites[i].satelliteID != 0) { 
-                Serial.printf("ID: %02d | Elev: %02d | Azim: %03d | SNR: %02d\n",
-                    masterSatellites[i].satelliteID, masterSatellites[i].elevation, 
-                    masterSatellites[i].azimuth, masterSatellites[i].SNR);
-            }
+    GNSSData d;
+    SatelliteData sats[MAX_SATELLITES];
+    if (xSemaphoreTake(gnssMutex, pdMS_TO_TICKS(10)) != pdTRUE) return;
+    d = masterGNSSData;
+    memcpy(sats, masterSatellites, sizeof(sats));
+    xSemaphoreGive(gnssMutex);
+
+    Serial.println("====== GNSS TELEMETRY ======");
+
+    // Time and date, %02d forces leading zeros
+    Serial.printf("Time: %02d:%02d:%02d | Date: %02d/%02d/%02d\n",
+        d.time_Hours, d.time_Minutes, d.time_Seconds,
+        d.time_Day, d.time_Month, d.time_Year);
+
+    Serial.printf("Lat: %d deg %d min %.4f sec %c  (%.7f)\n",
+        d.latitude_Degrees, d.latitude_Minutes, d.latitude_Seconds, d.latitude_Direction,
+        d.latitude_deg);
+    Serial.printf("Lon: %d deg %d min %.4f sec %c  (%.7f)\n",
+        d.longitude_Degrees, d.longitude_Minutes, d.longitude_Seconds, d.longitude_Direction,
+        d.longitude_deg);
+
+    Serial.printf("Fix: %d | Sats used/visible: %d/%d | HDOP: %.2f | Alt: %.1fm | Spd: %.2f knots | Course: %s%.1f | NMEA errors: %lu\n",
+        d.fixQuality, d.satellite_number_active, d.satellite_number_visible,
+        d.HDOP, d.true_Altitude, d.ground_Speed,
+        d.courseValid ? "" : "(invalid) ", d.course_Degrees,
+        (unsigned long)nmeaChecksumErrors);
+
+    int visible = d.satellite_number_visible;
+    if (visible > MAX_SATELLITES) visible = MAX_SATELLITES;
+
+    Serial.println("--- Visible GPS Satellites ---");
+    for (int i = 0; i < visible; i++) {
+        if (sats[i].satelliteID != 0) {
+            Serial.printf("ID: %02d | Elev: %02d | Azim: %03d | SNR: %02d\n",
+                sats[i].satelliteID, sats[i].elevation, sats[i].azimuth, sats[i].SNR);
         }
-        Serial.println("==========================\n");
-        
-        // 6. Give the key back!
-        xSemaphoreGive(gnssMutex);
     }
+    Serial.println("==========================\n");
 }

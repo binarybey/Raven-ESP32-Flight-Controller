@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# DEM tiles (~3 GB) - regenerate with tar-to-bin.py, never commit
+test/vtol_bin_tiles/
