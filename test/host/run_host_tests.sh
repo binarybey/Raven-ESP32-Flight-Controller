@@ -13,7 +13,7 @@ cd "$(dirname "$0")/../.."
 CXX=${CXX:-"python -m ziglang c++"}
 OUT="${TMPDIR:-/tmp}/ahrs_host_tests.exe"
 $CXX -std=gnu++17 -O1 -Wall -Wextra \
-  -I"lib/ReadGNSS" -I"lib/F-Code Interpreter" -I"lib/Flight Kinematics" -I"lib/Terrain" \
+  -I"lib/ReadGNSS" -I"lib/F-Code Interpreter" -I"lib/Flight Kinematics" -I"lib/Terrain" -I"lib/Hardware Interface" \
   test/host/host_tests.cpp \
   lib/ReadGNSS/nmea_parse.cpp \
   "lib/F-Code Interpreter/fcode_interpreter.cpp" \

@@ -77,6 +77,16 @@ struct MPU_output
 };
 
 
+// One calibrated IMU sample with the time each part was last read -
+// TaskIMU fills it, TaskFlightControl reads it (under imuMutex).
+struct ImuSample {
+    D3 gyro;            // deg/s, offset-corrected
+    D3 accel;           // g, calibrated
+    D3 mag;             // mG, calibrated
+    int64_t imu_us;     // esp_timer time of the last good MPU6050 read
+    int64_t mag_us;     // esp_timer time of the last good HMC5883L read
+};
+
 extern D3 accel;
 extern D3 gyro;
 extern D3 mag;
@@ -120,5 +130,10 @@ void applyAccelCalibration(const D3 &accelt, D3 &accelCalibrated);
 bool measureGyroOffset(D3 &accelt, D3 &gyrot, D3 &gyroOffsetTemp);
 
 void calibrateGyro(D3 &gyrot, const D3 &gyrotOffset, D3 &gyroCalibrated);
+
+// Reads MPU6050 + HMC5883L and applies all calibrations into `sample`. Call
+// with i2cMutex held. Only the parts that read successfully are updated (with
+// their timestamp now_us). Returns true if the MPU6050 read succeeded.
+bool readImuSample(ImuSample &sample, int64_t now_us);
 
 void printIMU(const D3 &acct, const D3 &gyrot, const D3 &magt);

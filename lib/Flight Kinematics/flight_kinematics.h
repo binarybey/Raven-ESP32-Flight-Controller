@@ -79,7 +79,9 @@
 //   objective vector v = [F_up, F_x, L, M, N]        (N and N*m)
 //        |
 //        v  weighted damped least squares against B(alpha, T, q)
-//   effectors u = [T_total, dT, da_pitch, da_yaw, aileron, elevator, rudder]
+//   effectors u = [T_total, dT, dnac_L, dnac_R, aileron, elevator, rudder]
+//   (dnac_L/R: each nacelle's deviation from the collective schedule, each
+//   bounded by its own mechanical range - see nacelle_min_rad/max_rad)
 //
 // The rate PIDs output rad/s^2 and are multiplied by the inertia tensor. That
 // makes the gains physically meaningful and mode-independent - grab Ixx/Iyy/Izz
@@ -110,7 +112,7 @@
 // ALTITUDE REFERENCE: the F43 clearance is held above the DEM terrain
 // (GLO-30), not above the arming point: AGL = MSL altitude - max terrain
 // elevation under the vehicle and along a look-ahead stretch of the path
-// (main.cpp TaskTerrain). The MSL altitude is baro for short-term motion,
+// (TaskTerrain in main.cpp). The MSL altitude is baro for short-term motion,
 // continuously re-calibrated by GNSS, so baro errors (non-ISA temperature,
 // humidity, weather drift) can't accumulate.
 //
@@ -122,6 +124,7 @@
 
 #include "pid_f32.h"
 #include "fcode_interpreter.h"
+#include "hardware_interface.h"
 
 namespace raven {
 
@@ -271,13 +274,15 @@ struct ActuatorCmd {
 // ---------------------------------------------------------------------------
 struct VehicleConfig {
     // ---- mass / inertia (about the CENTER OF MASS, BODY axes) ----
-    // DESIGN ESTIMATE at MTOW 2.5 kg (the stated absolute maximum - using it
-    // keeps the conversion corridor conservative). Built from:
+    // DESIGN ESTIMATE at MTOW 2.0 kg (the target maximum - using it keeps the
+    // conversion corridor conservative). Built from:
     //   airframe, CAD "V-22 Osprey v24": 0.567 kg, CAD inertia (below)
-    //   battery 4S5P 18650 + wiring ~1.0 kg near the CG (box ~72x90x65 mm)
-    //   2 nacelles x ~0.28 kg at +/-l_y (motor, 3-blade prop, tilt servo +
+    //   battery 4S4P 18650 + wiring ~0.8 kg near the CG (box ~72x72x65 mm)
+    //   2 nacelles x ~0.25 kg at +/-l_y (motor, 12" 3-blade prop, tilt servo +
     //     mechanism, ESC)
-    //   avionics ~0.15 kg, surface servos ~0.05 kg, rest = margin at the CG
+    //   avionics ~0.15 kg, surface servos ~0.05 kg
+    // That sums to ~2.1 kg - the 2.0 kg target needs a lighter airframe print
+    // or 4S3P (which drops thrust/weight to ~1.4, see thrust_max_per_rotor).
     // Replace with a CAD export once the components are modelled (plain
     // blocks with the right mass and position are enough). Every gain is
     // inertia-normalised, so these four numbers are all the controller needs.
@@ -290,11 +295,11 @@ struct VehicleConfig {
     // (roll, body Ixx) is CAD Iyy, and about the SPAN axis (pitch, body Iyy)
     // is CAD Ixx. Same numbers, different axis names - roll IS the Ixx field.
     //   airframe only:  roll 4.342e-3, pitch 3.009e-3, yaw 6.770e-3 kg*m^2
-    //   nacelles add 2*0.28*0.18^2 = 0.018 to roll and yaw.
-    float mass = 2.5f;         // kg
-    float Ixx  = 0.024f;       // kg*m^2, roll  (airframe 0.0043 + nacelles 0.018 + battery/servos)
-    float Iyy  = 0.0065f;      // kg*m^2, pitch (airframe 0.0030 + battery 0.0010 + nacelles 0.0014 + tail servos)
-    float Izz  = 0.027f;       // kg*m^2, yaw   (airframe 0.0068 + nacelles 0.018 + battery/servos)
+    //   nacelles add 2*0.25*0.18^2 = 0.016 to roll and yaw.
+    float mass = 2.0f;         // kg
+    float Ixx  = 0.021f;       // kg*m^2, roll  (airframe 0.0043 + nacelles 0.016 + battery/servos)
+    float Iyy  = 0.0060f;      // kg*m^2, pitch (airframe 0.0030 + battery 0.0006 + nacelles 0.0013 + tail servos)
+    float Izz  = 0.025f;       // kg*m^2, yaw   (airframe 0.0068 + nacelles 0.016 + battery/servos)
 
     // ---- nacelle geometry relative to the CG (see the derivation at the top) ----
     // Measured to the nacelle TILT AXIS where the prop shaft crosses it - not
@@ -308,15 +313,16 @@ struct VehicleConfig {
     float l_z = 0.05f;      // m, tilt axis ABOVE the CG. DESIGN TARGET 40-60 mm.
                             //    Hover PITCH authority comes only from tilting both
                             //    nacelles together (no cyclic on fixed props):
-                            //    M = T_total * l_z * sin(nacelle_pitch_band). At
-                            //    2.5 kg, 50 mm and +/-10 deg that's 0.21 N*m ->
-                            //    ~33 rad/s^2 with Iyy above. l_z -> 0 means NO hover
+                            //    M = T_total * l_z * sin(nacelle_ctrl_band). At
+                            //    2.0 kg, 50 mm and +/-15 deg that's 0.25 N*m ->
+                            //    ~42 rad/s^2 with Iyy above. l_z -> 0 means NO hover
                             //    pitch control. A lower battery raises l_z.
     float l_x = 0.0f;       // m, tilt axis AHEAD of the CG. DESIGN TARGET 0: the
                             //    hover thrust line must pass through the CG, or a
                             //    steady tilt of atan(l_x/l_z) is spent just trimming
-                            //    (10 mm with l_z 50 mm = 11 deg - the whole pitch
-                            //    band). Keep |l_x| <= ~0.2*l_z; move the battery to get it.
+                            //    (10 mm with l_z 50 mm = 11 deg of the +/-15 deg
+                            //    control band). Keep |l_x| <= ~0.2*l_z; move the
+                            //    battery to get it.
 
     // ---- wing / aero ----
     // Rectangular NACA 23018 wing (CAD). Coefficients are estimates until the
@@ -343,15 +349,25 @@ struct VehicleConfig {
 
     // ---- propulsion ----
     // ESTIMATE until a static thrust test: momentum theory (figure of merit
-    // 0.55, 80% motor+ESC) for an 11-inch 3-blade prop at 1500 m, limited by a
-    // 4S5P pack at 14 A/cell (70 A). thrust/weight 1.47 at 2.5 kg - 4P would
-    // only give ~1.26, below what validateConfig() accepts.
-    float thrust_max_per_rotor = 18.0f;   // N, static, at full throttle
+    // 0.55, 80% motor+ESC) for a 12-inch 3-blade prop at 1500 m, limited by a
+    // 4S4P pack at 14 A/cell (56 A): ~16 N per rotor, thrust/weight 1.66 at
+    // 2.0 kg. 4S3P (42 A) would give ~13.5 N, thrust/weight ~1.38.
+    float thrust_max_per_rotor = 16.0f;   // N, static, at full throttle
     float thrust_min_per_rotor = 0.5f;    // N, keep ESCs spinning when armed
     float nacelle_rate_max     = 0.70f;   // rad/s, servo slew limit
-    float nacelle_pitch_band   = 0.17f;   // rad (~10 deg) max collective
-                                          // perturbation available to pitch
-    float nacelle_yaw_band     = 0.14f;   // rad (~8 deg) max differential tilt
+
+    // Mechanical tilt range of EACH nacelle, angle from vertical. Negative =
+    // rotor leaning AFT of vertical. The allocator treats the two nacelles as
+    // separate effectors and never commands outside this range, so e.g. a
+    // hover yaw (one nacelle forward, one aft) and a nose-up pitch (both aft)
+    // can use the aft travel instead of being clipped at the output.
+    float nacelle_min_rad      = -0.2618f;   // -15 deg
+    float nacelle_max_rad      =  1.6708f;   // +95.7 deg
+    // Max deviation of each nacelle from the collective schedule (alpha) for
+    // attitude control - shared between pitch (both same way) and yaw (opposite
+    // ways). Small enough to keep the Jacobian's linearisation honest
+    // (cos 15 deg = 0.97).
+    float nacelle_ctrl_band    =  0.2618f;   // rad, 15 deg
 
     // ---- conversion corridor ----
     float stall_margin  = 1.25f;   // V >= margin * V_stall(alpha)
@@ -378,8 +394,8 @@ struct VehicleConfig {
     // Effector cost weights (higher = allocator avoids using it).
     float w_thrust        = 1.0e-4f;
     float w_dthrust       = 1.0e-3f;
-    float w_dalpha_pitch  = 3.0f;
-    float w_dalpha_yaw    = 3.0f;
+    float w_nacelle       = 1.5f;   // per nacelle (= the old 3.0 on collective and
+                                    // differential tilt, split across two effectors)
     float w_aileron       = 1.0f;
     float w_elevator      = 1.0f;
     float w_rudder        = 1.0f;
@@ -505,6 +521,10 @@ enum ConfigIssue : uint32_t {
 };
 const char *configIssueText(uint32_t single_bit);
 
+// The flight code's actuator command -> the hardware backend's format
+// (lib/Hardware Interface). Throttles are forced to 0 while disarmed.
+ActuatorOutputs toActuatorOutputs(const ActuatorCmd &cmd);
+
 // ---------------------------------------------------------------------------
 // Gain set
 // ---------------------------------------------------------------------------
@@ -563,7 +583,7 @@ struct ControlGains {
 // barometer altitude at ~2Hz). Call update() only when a genuinely NEW
 // sample has arrived - calling it every control-loop tick with a repeated
 // stale value will bias the estimate toward zero between samples. Owned and
-// driven by whichever task reads that sensor (see main.cpp's TaskBMP).
+// driven by whichever task reads that sensor (see TaskBMP in main.cpp).
 // ---------------------------------------------------------------------------
 class RateEstimator {
   public:
@@ -604,8 +624,8 @@ class RateEstimator {
 // RawSensors - everything FlightKinematics::runCycle() needs, as plain
 // floats/bools only. No Fusion.h, no Arduino.h, no project-specific sensor
 // struct types - this is the ONE boundary where hardware/library types get
-// unpacked into plain data before crossing into this module. main.cpp reads
-// its sensors (however it reads them, whatever mutexes that needs) and fills
+// unpacked into plain data before crossing into this module. The control task
+// (TaskFlightControl in main.cpp) reads the sensors (whatever mutexes that needs) and fills
 // this struct; runCycle() does the rest, including the NWU sign correction.
 // Every group carries its own validity flag - never fill a group with
 // defaults and mark it valid.
@@ -651,11 +671,11 @@ struct RawSensors {
     float    gnss_course_rad    = 0.0f;   // rad, TRUE course over ground, compass
     uint32_t gnss_vel_seq       = 0;      // bumped once per accepted RMC sentence
 
-    // --- pitot (see hardware_interface.h / main.cpp TaskAirData) ---
+    // --- pitot (see hardware_interface.h / air_data.h) ---
     bool  pitot_valid = false;   // fresh, zeroed, plausible
     float pitot_q_pa  = 0.0f;    // Pa, zero-offset removed, filtered
 
-    // --- terrain (DEM, main.cpp TaskTerrain, ~1 Hz) ---
+    // --- terrain (DEM, terrain_following.h, ~1 Hz) ---
     bool  terrain_valid  = false;  // fresh lookup for the current position
     float terrain_elev_m = 0.0f;   // m MSL: max over the footprint under the vehicle
                                    // AND along the look-ahead stretch of the path
@@ -730,7 +750,8 @@ class FlightKinematics {
     void  updateMode(const VehicleState &st);
     float scheduleAlpha(float dt, const VehicleState &st, ActuatorCmd &out);
     void  buildEffectiveness(float alpha, float thrust_total, float q_dyn, float B[5][7]) const;
-    void  allocate(const float B[5][7], const float v[5], const float pri[5], float u[7]);
+    void  allocate(const float B[5][7], const float v[5], const float pri[5], float alpha,
+                   float u[7]);
     float wingLift(const VehicleState &st, float V, float q_dyn) const;
     float corridorCeiling(float V, float rho) const;
 

@@ -10,6 +10,8 @@
 #include <cstring>
 #include <string>
 #include <functional>
+#include <filesystem>
+#include <fstream>
 
 #include "nmea_parse.h"
 #include "fcode_interpreter.h"
@@ -289,7 +291,7 @@ static void testFlightKinematics() {
         std::printf("    default config issues: 0x%x, stall %.1f m/s, hover %.0f%%\n", issues,
                     fk.stallSpeed(1.225f), 100*cfg.mass*cfg.g/(2*cfg.thrust_max_per_rotor));
         cfg.mass = 4.0f;
-        CHECK((fk.begin(cfg, g) & raven::CFG_HOVER_THRUST) != 0, "4 kg on 18 N rotors not flagged");
+        CHECK((fk.begin(cfg, g) & raven::CFG_HOVER_THRUST) != 0, "4 kg on 16 N rotors not flagged");
     }
 
     // --- declination (+ NWU sign flip) ---
@@ -464,6 +466,51 @@ static void testFlightKinematics() {
               raven::failsafeReasonName(s.fk.failsafeReason()));
     }
 
+    // --- nacelles in hover: aft travel for nose-up pitch, differential for
+    //     yaw, and both at once without leaving the mechanical range ---
+    {
+        fcode::begin(nullptr);
+        const raven::VehicleConfig cfg;
+        auto inRange = [&](const raven::ActuatorCmd &o) {
+            return o.nacelle_left  >= cfg.nacelle_min_rad - 1e-4f && o.nacelle_left  <= cfg.nacelle_max_rad + 1e-4f &&
+                   o.nacelle_right >= cfg.nacelle_min_rad - 1e-4f && o.nacelle_right <= cfg.nacelle_max_rad + 1e-4f;
+        };
+        Sim s; s.run(3);
+        const char *why; CHECK(s.fk.arm(&why), "arm: %s", why);
+        bool ok = true;
+
+        // Nose 20 deg DOWN (Fusion pitch is nose-down positive): the stabiliser
+        // wants nose-up, which in hover means both nacelles tilting AFT.
+        s.raw.fusion_pitch_deg = 20.0f;
+        float minNac = 1.0f;
+        s.run(1.0, true, [&]{ minNac = std::fmin(minNac, std::fmin(s.out.nacelle_left, s.out.nacelle_right));
+                              ok = ok && inRange(s.out); });
+        CHECK(minNac < -0.11f, "nacelles never tilted past the old -5.7 deg clip (min %.1f deg)", minNac * 57.3);
+        CHECK(ok, "pitch: a nacelle left its mechanical range");
+
+        // Level again, yawing LEFT at 60 deg/s (Fusion z is up): the rate loop
+        // wants yaw right = left nacelle forward, right nacelle aft.
+        s.raw.fusion_pitch_deg = 0.0f; s.run(1.0);
+        s.raw.fusion_gyro_z_dps = 60.0f;
+        float maxDiff = 0.0f, minRight = 1.0f;
+        s.run(0.5, true, [&]{ maxDiff  = std::fmax(maxDiff, s.out.nacelle_left - s.out.nacelle_right);
+                              minRight = std::fmin(minRight, s.out.nacelle_right);
+                              ok = ok && inRange(s.out); });
+        CHECK(maxDiff > 0.15f && minRight < -0.05f, "yaw: diff %.1f deg, right min %.1f deg",
+              maxDiff * 57.3, minRight * 57.3);
+        CHECK(ok, "yaw: a nacelle left its mechanical range");
+
+        // Both at once: the aft-going nacelle hits -15 deg, yaw must survive
+        // through the other one instead of being clipped away.
+        s.raw.fusion_pitch_deg = 20.0f;
+        float diffBoth = 0.0f;
+        s.run(0.5, true, [&]{ diffBoth = s.out.nacelle_left - s.out.nacelle_right; ok = ok && inRange(s.out); });
+        CHECK(ok, "pitch+yaw: a nacelle left its mechanical range");
+        CHECK(diffBoth > 0.05f, "pitch+yaw: yaw differential lost (%.1f deg)", diffBoth * 57.3);
+        std::printf("    hover nacelles: pitch-down min %.1f deg, yaw diff %.1f deg, pitch+yaw diff %.1f deg\n",
+                    minNac * 57.3, maxDiff * 57.3, diffBoth * 57.3);
+    }
+
     // --- sensor failure: IMU ---
     {
         fcode::begin(nullptr);
@@ -575,6 +622,43 @@ static void testTerrain() {
     // Outside coverage -> NAN, never a low elevation
     CHECK(std::isnan(terrain::lookupElevation(35.5, 30.5)), "outside coverage not NAN");
     CHECK(std::isnan(terrain::lookupMaxElevation(36.00001, 30.5, 2)), "footprint half outside coverage not NAN");
+
+    // Boot-time route check (terrain::checkRoute) on real routes: the tile set
+    // ends at 36 N, so a route 10" (309 m) north of it is inside the DEM but
+    // its 500 m drift corridor is not; 1' (1.85 km) north is fine.
+    auto pathPoint = [](float s, double &lat, double &lon) -> bool {
+        float x, y;
+        if (!fcode::pathPointAt(s, x, y)) return false;
+        fcode::localToGps(x, y, lat, lon);
+        return true;
+    };
+    auto route = [&](const char *mission, const char *what, bool expectOk) {
+        CHECK(fcode::begin(mission), "%s: parse %s", what, fcode::info().error);
+        const terrain::RouteCheck rc = terrain::checkRoute(fcode::info().total_length_m, pathPoint,
+                                                           60.0f, 500.0f, 1);
+        CHECK(rc.ok == expectOk, "%s: ok=%d (missing %d/%d, first at %.0f m)", what, rc.ok,
+              rc.missing, rc.points, rc.first_missing_m);
+        std::printf("    route %-34s ok=%d points=%d tiles=%d max=%.0f m\n", what, rc.ok, rc.points,
+                    rc.tiles, rc.max_elev_m);
+    };
+    route("F43; Z50;\nF90; X0325000; Y395000;\nF01; X+1200.0; Y+0.0;\nF01; X+0.0; Y+1200.0;\n"
+          "F01; X-1200.0; Y+0.0;\nF01; X+0.0; Y-1200.0;\nF39;\n",
+          "4-tile loop around 40N 33E", true);
+    route("F43; Z50;\nF90; X0303000; Y360010;\nF01; X+600.0; Y+0.0;\nF39;\n",
+          "309 m from the DEM edge", false);
+    route("F43; Z50;\nF90; X0303000; Y360100;\nF01; X+600.0; Y+0.0;\nF39;\n",
+          "1.85 km from the DEM edge", true);
+
+    // A tile truncated while copying to the SD card is refused outright.
+    namespace fs = std::filesystem;
+    const fs::path tmp = fs::temp_directory_path() / "raven_truncated_tiles";
+    fs::create_directories(tmp);
+    { std::ofstream(tmp / "N39E032.bin", std::ios::binary) << std::string(4096, '\0'); }
+    terrain::begin(0, tmp.string().c_str());
+    CHECK(!terrain::tileAvailable(39.5, 32.5), "truncated tile accepted");
+    CHECK(std::isnan(terrain::lookupElevation(39.0001, 32.0001)), "truncated tile read");
+    fs::remove_all(tmp);
+    terrain::begin(0, dir);
 }
 
 int main() {

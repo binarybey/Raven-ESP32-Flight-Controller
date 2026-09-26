@@ -21,7 +21,7 @@
 // Every lookup seeks straight to a byte offset - no tile is ever loaded
 // into RAM. Up to 4 tile files stay open (least-recently-used), so lookups
 // near a tile corner don't reopen files. NOT thread-safe: call from ONE task
-// (main.cpp's TaskTerrain, plus the boot-time route check before tasks
+// (TaskTerrain in main.cpp, plus the boot-time route check before tasks
 // start) - never from the control loop, SD reads take milliseconds.
 
 #pragma once
@@ -45,6 +45,28 @@ float lookupElevation(double lat_deg, double lon_deg);
 // low. Use this for clearance decisions: r=2 covers GPS error plus the
 // half-sample ambiguity of the grid registration.
 float lookupMaxElevation(double lat_deg, double lon_deg, int radius_samples);
+
+// True if the tile containing the position is on the card at its full size
+// (25,920,000 bytes) - a tile truncated while copying to the SD is rejected
+// here instead of failing mid-flight.
+bool tileAvailable(double lat_deg, double lon_deg);
+
+// Boot-time route check. Walks a route of length_m, taking positions from
+// pointAt(s) every step_m, and requires:
+//   - the elevation footprint (radius samples) available at every point;
+//   - every tile within margin_m of the route present at full size, so the
+//     vehicle can drift off the path without running off the DEM.
+struct RouteCheck {
+    bool  ok              = false;
+    int   points          = 0;
+    int   missing         = 0;       // points failing either requirement
+    float first_missing_m = -1.0f;   // along-route distance of the first one
+    int   tiles           = 0;       // distinct tiles the corridor touches
+    float max_elev_m      = -1.0e9f; // highest terrain along the route
+};
+typedef bool (*RoutePointFn)(float s_m, double &lat_deg, double &lon_deg);
+RouteCheck checkRoute(float length_m, RoutePointFn pointAt, float step_m, float margin_m,
+                      int radius_samples);
 
 // ---- exposed for testing - pure math, no file I/O ----
 // Which tile (south-west corner) and sample (row from the north edge,

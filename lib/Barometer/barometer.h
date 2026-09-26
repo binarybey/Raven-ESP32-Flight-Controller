@@ -1,7 +1,9 @@
 #pragma once
 #include "I2C_IO.h"
+#include "flight_kinematics.h"
 #define BMP280_ADDRESS 0x76 // SDO to GND
 #define BMP280_OUTPUT_REG 0xF7
+#define BARO_FRESH_US 1000000 // older than 2 samples (2 Hz) = barometer not reporting
 
 struct calibData280 {
     uint16_t dig_T1;
@@ -29,6 +31,17 @@ struct bmpReadingsDouble {
     double altitude;
 };
 
+// Latest barometer result - TaskBMP fills it, TaskFlightControl reads it
+// (under baroMutex).
+struct BaroSnapshot {
+    bool    valid;
+    float   altitude;       // m
+    float   climb_rate;     // m/s, positive up
+    float   pressure_pa;
+    float   temperature_c;
+    int64_t sample_us;      // esp_timer time of the reading
+};
+
 
 extern calibData280 BMP280calib;
 
@@ -47,3 +60,7 @@ void initBMP280();
 bool readBMP280(const calibData280 &calib, bmpReadingsInt32 &raw_readings, bmpReadingsDouble &output);
 
 void printPressTemp(const bmpReadingsDouble &outvals);
+
+// Barometer snapshot -> the flight code's baro inputs (valid only if fresher
+// than BARO_FRESH_US).
+void baroToRaw(const BaroSnapshot &baro, int64_t now_us, raven::RawSensors &raw);

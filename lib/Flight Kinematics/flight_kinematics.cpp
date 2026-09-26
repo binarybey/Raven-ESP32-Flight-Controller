@@ -69,12 +69,25 @@ const char *configIssueText(uint32_t bit) {
     return "?";
 }
 
+ActuatorOutputs toActuatorOutputs(const ActuatorCmd &cmd) {
+    ActuatorOutputs hw;
+    hw.armed             = cmd.armed;
+    hw.throttle_left     = cmd.armed ? cmd.thrust_left  : 0.0f;
+    hw.throttle_right    = cmd.armed ? cmd.thrust_right : 0.0f;
+    hw.nacelle_left_rad  = cmd.nacelle_left;
+    hw.nacelle_right_rad = cmd.nacelle_right;
+    hw.aileron           = cmd.aileron;
+    hw.elevator          = cmd.elevator;
+    hw.rudder            = cmd.rudder;
+    return hw;
+}
+
 // Effector indices into u[7]
 enum : int {
     U_THRUST = 0,   // N, total thrust  (T_L + T_R)
     U_DTHRUST,      // N, differential  (T_L - T_R)
-    U_DA_PITCH,     // rad, collective nacelle perturbation about the schedule
-    U_DA_YAW,       // rad, differential nacelle tilt
+    U_NAC_L,        // rad, LEFT nacelle deviation from the collective schedule
+    U_NAC_R,        // rad, RIGHT nacelle deviation from the collective schedule
     U_AILERON,      // -1..1
     U_ELEVATOR,     // -1..1
     U_RUDDER,       // -1..1
@@ -471,28 +484,37 @@ void FlightKinematics::buildEffectiveness(float alpha, float T, float q_dyn,
     const float b_ = cfg_.wing_span;
     const float c_ = cfg_.mean_chord;
 
+    // Each nacelle carries half the thrust (linearised about dT = 0):
+    // d/d(alpha_L) of T_L*cos(alpha_L) = -(T/2)*sin(alpha), etc.
+    const float Th = 0.5f * T;
+
     // F_up = sum T_i*cos(alpha_i)
-    B[V_FUP][U_THRUST]   =  ca;
-    B[V_FUP][U_DA_PITCH] = -T * sa;
+    B[V_FUP][U_THRUST] =  ca;
+    B[V_FUP][U_NAC_L]  = -Th * sa;
+    B[V_FUP][U_NAC_R]  = -Th * sa;
 
     // F_x = sum T_i*sin(alpha_i)
-    B[V_FX][U_THRUST]   = sa;
-    B[V_FX][U_DA_PITCH] = T * ca;
+    B[V_FX][U_THRUST] = sa;
+    B[V_FX][U_NAC_L]  = Th * ca;
+    B[V_FX][U_NAC_R]  = Th * ca;
 
     // L = l_y*( T_L*cos(a_L) - T_R*cos(a_R) )
     B[V_L][U_DTHRUST] =  cfg_.l_y * ca;
-    B[V_L][U_DA_YAW]  = -cfg_.l_y * T * sa;
+    B[V_L][U_NAC_L]   = -cfg_.l_y * Th * sa;
+    B[V_L][U_NAC_R]   =  cfg_.l_y * Th * sa;
     B[V_L][U_AILERON] =  qS * b_ * cfg_.Cl_da;
 
     // M = -l_z*sum T_i*sin(a_i) + l_x*sum T_i*cos(a_i)
-    B[V_M][U_THRUST]    = -cfg_.l_z * sa + cfg_.l_x * ca;
-    B[V_M][U_DA_PITCH]  = -T * (cfg_.l_z * ca + cfg_.l_x * sa);
-    B[V_M][U_ELEVATOR]  =  qS * c_ * cfg_.Cm_de;
+    B[V_M][U_THRUST]   = -cfg_.l_z * sa + cfg_.l_x * ca;
+    B[V_M][U_NAC_L]    = -Th * (cfg_.l_z * ca + cfg_.l_x * sa);
+    B[V_M][U_NAC_R]    = -Th * (cfg_.l_z * ca + cfg_.l_x * sa);
+    B[V_M][U_ELEVATOR] =  qS * c_ * cfg_.Cm_de;
 
     // N = l_y*( T_L*sin(a_L) - T_R*sin(a_R) )
-    B[V_N][U_DTHRUST] = cfg_.l_y * sa;
-    B[V_N][U_DA_YAW]  = cfg_.l_y * T * ca;
-    B[V_N][U_RUDDER]  = qS * b_ * cfg_.Cn_dr;
+    B[V_N][U_DTHRUST] =  cfg_.l_y * sa;
+    B[V_N][U_NAC_L]   =  cfg_.l_y * Th * ca;
+    B[V_N][U_NAC_R]   = -cfg_.l_y * Th * ca;
+    B[V_N][U_RUDDER]  =  qS * b_ * cfg_.Cn_dr;
 
     // Note what happens automatically here: every aero column carries a factor
     // of q. At low airspeed those columns vanish and the allocator simply does
@@ -506,9 +528,9 @@ void FlightKinematics::buildEffectiveness(float alpha, float T, float q_dyn,
 //   u = Winv*B'^T * (B'*Winv*B'^T + lambda*I)^-1 * v'
 // ===========================================================================
 void FlightKinematics::allocate(const float B[NV][NU], const float v[NV],
-                                const float pri[NV], float u[NU]) {
+                                const float pri[NV], float alpha, float u[NU]) {
     const float w[NU] = {
-        cfg_.w_thrust, cfg_.w_dthrust, cfg_.w_dalpha_pitch, cfg_.w_dalpha_yaw,
+        cfg_.w_thrust, cfg_.w_dthrust, cfg_.w_nacelle, cfg_.w_nacelle,
         cfg_.w_aileron, cfg_.w_elevator, cfg_.w_rudder
     };
     float winv[NU];
@@ -525,10 +547,13 @@ void FlightKinematics::allocate(const float B[NV][NU], const float v[NV],
     const float T_tot_min = 2.0f * cfg_.thrust_min_per_rotor;
     const float T_tot_max = 2.0f * cfg_.thrust_max_per_rotor;
     const float dT_max    = cfg_.thrust_max_per_rotor - cfg_.thrust_min_per_rotor;
-    const float lo[NU] = { T_tot_min, -dT_max, -cfg_.nacelle_pitch_band,
-                           -cfg_.nacelle_yaw_band, -1.0f, -1.0f, -1.0f };
-    const float hi[NU] = { T_tot_max,  dT_max,  cfg_.nacelle_pitch_band,
-                            cfg_.nacelle_yaw_band, 1.0f, 1.0f, 1.0f };
+    // Each nacelle: its control band around the schedule, cut to what the
+    // mechanism can actually reach from here (e.g. at alpha = 0 it can go
+    // 15 deg aft; at alpha = 90 deg only 5.7 deg further forward).
+    const float nac_lo = fmaxf(-cfg_.nacelle_ctrl_band, cfg_.nacelle_min_rad - alpha);
+    const float nac_hi = fminf( cfg_.nacelle_ctrl_band, cfg_.nacelle_max_rad - alpha);
+    const float lo[NU] = { T_tot_min, -dT_max, nac_lo, nac_lo, -1.0f, -1.0f, -1.0f };
+    const float hi[NU] = { T_tot_max,  dT_max, nac_hi, nac_hi,  1.0f,  1.0f,  1.0f };
 
     bool  free_[NU];
     for (int k = 0; k < NU; ++k) { u[k] = 0.0f; free_[k] = true; }
@@ -786,7 +811,7 @@ void FlightKinematics::update(float dt, const VehicleState &st, const Setpoints 
 
     float B[NV][NU], u[NU];
     buildEffectiveness(alpha, T_est, q_dyn, B);
-    allocate(B, v, pri, u);
+    allocate(B, v, pri, alpha, u);
 
     // ---------------- map effectors to hardware ----------------
     const float T_total = clampf(u[U_THRUST],
@@ -805,10 +830,10 @@ void FlightKinematics::update(float dt, const VehicleState &st, const Setpoints 
     out.thrust_left  = clampf(sqrtf(T_L / cfg_.thrust_max_per_rotor), 0.0f, 1.0f);
     out.thrust_right = clampf(sqrtf(T_R / cfg_.thrust_max_per_rotor), 0.0f, 1.0f);
 
-    float nac_L = alpha + u[U_DA_PITCH] + u[U_DA_YAW];
-    float nac_R = alpha + u[U_DA_PITCH] - u[U_DA_YAW];
-    nac_L = clampf(nac_L, -0.10f, kHalfPi + 0.10f);
-    nac_R = clampf(nac_R, -0.10f, kHalfPi + 0.10f);
+    // The allocator already kept both inside the mechanical range; the clamp
+    // only guards against a degenerate solve.
+    float nac_L = clampf(alpha + u[U_NAC_L], cfg_.nacelle_min_rad, cfg_.nacelle_max_rad);
+    float nac_R = clampf(alpha + u[U_NAC_R], cfg_.nacelle_min_rad, cfg_.nacelle_max_rad);
 
     // servo slew limit
     const float max_step = cfg_.nacelle_rate_max * dt;

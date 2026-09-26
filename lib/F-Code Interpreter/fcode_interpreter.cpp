@@ -506,5 +506,30 @@ const char *loadFCodeFromSd(const char *path, uint8_t csPin) {
     return sdBuf_;
 }
 
+bool loadMission(const char *path, uint8_t csPin) {
+    const char *text = loadFCodeFromSd(path, csPin);
+    if (text == nullptr) {
+        Serial.printf("F-Code: %s - no mission, manual mode only.\n", loadError_);
+        return false;
+    }
+    begin(text);
+    const MissionInfo &mi = info_;
+    if (!mi.ok) {
+        Serial.printf("F-Code parse FAILED: %s", mi.error ? mi.error : "?");
+        if (mi.error_line > 0) Serial.printf(" (line %d)", mi.error_line);
+        Serial.println(" - no mission, manual mode only.");
+        return false;
+    }
+    Serial.printf("F-Code mission: %d segments, %.0f m, clearance %.0f m, origin %.6f N %.6f E\n",
+        mi.segment_count, mi.total_length_m, mi.ground_clearance_m,
+        mi.origin_lat_deg, mi.origin_lon_deg);
+    if (mi.unknown_lines > 0)
+        Serial.printf("  note: %d line(s) with unknown opcodes ignored\n", mi.unknown_lines);
+    if (mi.arc_warnings > 0)
+        Serial.printf("  WARNING: %d arc(s) disagree with their R/A fields (worst %.1f%% radius, %.1f deg sweep)\n",
+            mi.arc_warnings, mi.worst_arc_radius_err_pct, mi.worst_arc_sweep_err_deg);
+    return true;
+}
+
 }  // namespace fcode
 #endif  // ARDUINO

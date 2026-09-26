@@ -20,6 +20,7 @@ struct TileFile {
     bool readAt(long offset, void *buf, size_t n) {
         return f.seek(offset) && f.read(static_cast<uint8_t *>(buf), n) == n;
     }
+    long size() { return (long)f.size(); }
     void close() { if (f) f.close(); }
 };
 bool mountAndCheck(uint8_t csPin, const char *dir) { return SD.begin(csPin) && SD.exists(dir); }
@@ -32,6 +33,7 @@ struct TileFile {
     bool readAt(long offset, void *buf, size_t n) {
         return fseek(fp, offset, SEEK_SET) == 0 && fread(buf, 1, n, fp) == n;
     }
+    long size() { return fseek(fp, 0, SEEK_END) == 0 ? ftell(fp) : -1; }
     void close() { if (fp) { fclose(fp); fp = nullptr; } }
 };
 bool mountAndCheck(uint8_t, const char *dir) {
@@ -51,6 +53,7 @@ constexpr int     kN         = 3600;     // samples per degree / per tile edge
 constexpr int16_t kVoid      = -32768;
 constexpr int     kMaxRadius = 4;
 constexpr int     kSlots     = 4;        // open tile files kept (LRU)
+constexpr long    kTileBytes = (long)kN * kN * (long)sizeof(int16_t);   // 25,920,000
 
 char dir_[96] = "/vtol_bin_tiles";
 bool began_   = false;
@@ -88,6 +91,10 @@ TileFile *tile(int lat0, int lon0) {
     char path[128];
     snprintf(path, sizeof(path), "%s/N%02dE%03d.bin", dir_, lat0, lon0);
     if (!victim->file.open(path)) return nullptr;
+    if (victim->file.size() != kTileBytes) {   // truncated copy: never trust it
+        victim->file.close();
+        return nullptr;
+    }
     victim->open = true;
     victim->lat0 = lat0;
     victim->lon0 = lon0;
@@ -149,6 +156,60 @@ float lookupMaxElevation(double lat_deg, double lon_deg, int r) {
 
 float lookupElevation(double lat_deg, double lon_deg) {
     return lookupMaxElevation(lat_deg, lon_deg, 0);
+}
+
+bool tileAvailable(double lat_deg, double lon_deg) {
+    if (!began_) return false;
+    int lat0, lon0, row, col;
+    sampleIndex(lat_deg, lon_deg, lat0, lon0, row, col);
+    return tile(lat0, lon0) != nullptr;
+}
+
+RouteCheck checkRoute(float length_m, RoutePointFn pointAt, float step_m, float margin_m,
+                      int radius) {
+    RouteCheck rc;
+    if (!began_ || pointAt == nullptr || !(step_m > 0.0f)) return rc;
+
+    const double kMPerDegLat = 111132.0;   // = 30.87 m/arcsec, as fcode uses
+    const int kMaxTiles = 32;
+    int seenLat[kMaxTiles], seenLon[kMaxTiles];
+
+    for (float s = 0.0f; ; s += step_m) {
+        const float ss = (s < length_m) ? s : length_m;
+        double lat, lon;
+        bool good = pointAt(ss, lat, lon);
+        if (good) {
+            const float e = lookupMaxElevation(lat, lon, radius);
+            if (isnan(e)) good = false;
+            else if (e > rc.max_elev_m) rc.max_elev_m = e;
+        }
+        if (good) {
+            // The corners of the +/-margin box around the point reach every
+            // tile the box touches (it is far smaller than a tile).
+            const double dLat = margin_m / kMPerDegLat;
+            const double dLon = margin_m / (kMPerDegLat * cos(lat * 3.14159265358979 / 180.0));
+            for (int i = 0; i < 4 && good; ++i) {
+                const double la = lat + ((i & 1) ? dLat : -dLat);
+                const double lo = lon + ((i & 2) ? dLon : -dLon);
+                if (!tileAvailable(la, lo)) { good = false; break; }
+                int lat0, lon0, row, col;
+                sampleIndex(la, lo, lat0, lon0, row, col);
+                bool seen = false;
+                for (int k = 0; k < rc.tiles; ++k)
+                    if (seenLat[k] == lat0 && seenLon[k] == lon0) { seen = true; break; }
+                if (!seen && rc.tiles < kMaxTiles) {
+                    seenLat[rc.tiles] = lat0;
+                    seenLon[rc.tiles] = lon0;
+                    ++rc.tiles;
+                }
+            }
+        }
+        ++rc.points;
+        if (!good && rc.missing++ == 0) rc.first_missing_m = ss;
+        if (ss >= length_m) break;
+    }
+    rc.ok = (rc.points > 0 && rc.missing == 0);
+    return rc;
 }
 
 }  // namespace terrain

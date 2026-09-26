@@ -159,3 +159,20 @@ void printGNSS(){
     }
     Serial.println("==========================\n");
 }
+
+void gnssToRaw(const GNSSData &gnss, raven::RawSensors &raw) {
+    raw.gnss_fix_valid = (gnss.fixQuality > 0);
+    if (raw.gnss_fix_valid) {
+        raw.gnss_lat_deg    = gnss.latitude_deg;
+        raw.gnss_lon_deg    = gnss.longitude_deg;
+        raw.gnss_altitude_m = gnss.true_Altitude;
+    }
+    raw.gnss_hdop    = gnss.HDOP;
+    raw.gnss_sats    = gnss.satellite_number_active;
+    raw.gnss_fix_seq = gnss.fixSeq;
+
+    raw.gnss_vel_valid    = gnss.rmcValid;
+    raw.gnss_ground_speed = gnss.courseValid ? gnss.ground_Speed * 0.514444f : 0.0f;   // knots -> m/s
+    raw.gnss_course_rad   = gnss.courseValid ? gnss.course_Degrees * DEG_TO_RAD : 0.0f;
+    raw.gnss_vel_seq      = gnss.velSeq;
+}

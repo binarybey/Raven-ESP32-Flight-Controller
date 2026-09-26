@@ -149,6 +149,22 @@ void printIMU(const D3 &acct, const D3 &gyrot, const D3 &magt) {
 
 //  usage printIMU(accel, gyro, mag, true)
 
+bool readImuSample(ImuSample &sample, int64_t now_us) {
+    D3 accRaw, gyroRaw, magRaw;
+    const bool imuOk = readMPU(accRaw, gyroRaw);
+    if (imuOk) {
+        applyAccelCalibration(accRaw, sample.accel);
+        calibrateGyro(gyroRaw, gyroOffset, sample.gyro);
+        sample.imu_us = now_us;
+    }
+    if (readMag(magRaw)) {
+        applyMagCalibration(magRaw, sample.mag);
+        sample.mag_us = now_us;
+    }
+    return imuOk;
+}
+//  usage readImuSample(sample, esp_timer_get_time())
+
 void printUncalibratedAccel(const D3 &acct) {
     Serial.printf("%f,%f,%f\n",acct.x, acct.y, acct.z);
 }

@@ -81,3 +81,11 @@ bool readBMP280(const calibData280 &calib, bmpReadingsInt32 &raw_readings, bmpRe
 void printPressTemp(const bmpReadingsDouble &outvals) {
     Serial.printf("Pressure:    %f      Temperature:   %f       Elevation:    %f\n", outvals.pressure, outvals.temperature, outvals.altitude);
 }
+
+void baroToRaw(const BaroSnapshot &baro, int64_t now_us, raven::RawSensors &raw) {
+    raw.baro_valid         = baro.valid && (now_us - baro.sample_us) < BARO_FRESH_US;
+    raw.baro_altitude      = baro.altitude;
+    raw.baro_climb_rate    = baro.climb_rate;
+    raw.baro_pressure_pa   = baro.pressure_pa;
+    raw.baro_temperature_c = baro.temperature_c;
+}

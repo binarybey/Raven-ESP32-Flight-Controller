@@ -151,4 +151,9 @@ void update(float pos_x_m, float pos_y_m, NavOutput &out);
 const char *loadFCodeFromSd(const char *path, uint8_t csPin);
 const char *loadError();
 
+// loadFCodeFromSd() + begin(), printing the mission summary (or why there is
+// no mission) on Serial. Returns true if a mission is ready to fly. Either
+// step failing leaves no mission loaded - never a half-loaded or truncated one.
+bool loadMission(const char *path, uint8_t csPin);
+
 }  // namespace fcode

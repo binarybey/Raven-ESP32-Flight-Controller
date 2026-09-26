@@ -1,22 +1,12 @@
 // hardware_interface.h - the plug-in contract between the flight code and
 // the not-yet-wired hardware: ESCs + servos (outputs) and the pitot tube
-// (input). The flight code only ever talks to these two abstract classes;
-// your hardware libraries implement them and main.cpp points at your
-// implementation. Nothing else in the flight code changes when the hardware
-// arrives.
-//
-// Until then, main.cpp uses the Null* backends at the bottom of this file:
-// outputs are computed and logged but go nowhere, and there is no airspeed
-// (the flight code then refuses to convert out of hover - see
-// FlightKinematics::scheduleAlpha()).
-//
-// PLUGGING IN (main.cpp, section "Hardware backends"):
-//     #include "your_servo_esc_lib.h"
-//     static YourActuators yourActuators;          // : public raven::ActuatorBackend
-//     raven::ActuatorBackend *actuators = &yourActuators;
-// and the same for raven::AirDataBackend.
-//
-// This header deliberately has no Arduino/FreeRTOS dependency.
+// (input). The flight code only ever talks to these two abstract classes.
+
+// PLUGGING IN (src/main.cpp):
+//     #include "servo_esc_lib.h"
+//     static Actuators actuators;              // : public raven::ActuatorBackend
+// in place of the NullActuatorBackend line, and the same for the
+// raven::AirDataBackend.
 
 #pragma once
 
@@ -27,20 +17,19 @@ namespace raven {
 // ===========================================================================
 //
 // Universal format: physical angles for the nacelles, normalised -1..1 for
-// the control surfaces, normalised 0..1 for throttle. Your library owns ALL
+// the control surfaces, normalised 0..1 for throttle. Library owns ALL
 // hardware specifics: pulse widths, servo direction/reversal, trims, end
 // points, ESC protocol (PWM/OneShot/DShot), and clamping to what the
 // mechanism can physically reach.
 struct ActuatorOutputs {
     // false = DISARMED. ESCs must output their stop / disarmed signal no
     // matter what throttle_* say. Servos should keep tracking their commands
-    // (the nacelles are still driven while disarmed so you can bench-check
-    // them).
+    // (the nacelles are still driven while disarmed for bench-check).
     bool  armed = false;
 
     // Motor command, 0..1. 0 = stopped/ESC minimum, 1 = full throttle.
     // Already linearised for thrust by the flight code (thrust ~ throttle^2
-    // assumption until a measured thrust curve replaces it), so map it
+    // assumption until a measured thrust curve replaces it), so mapping
     // LINEARLY to the ESC range (e.g. 1000..2000 us). While armed the flight
     // code never sends less than the idle value set by
     // VehicleConfig::thrust_min_per_rotor, so props keep spinning.
@@ -50,10 +39,11 @@ struct ActuatorOutputs {
     // Nacelle tilt, radians measured FROM VERTICAL:
     //   0      = rotor axis straight up   (helicopter / hover)
     //   +pi/2  = rotor axis straight forward (airplane)
-    // Commanded range is [-0.10, pi/2 + 0.10] rad. Map it with a per-side
-    // two-point calibration (pulse at 0 rad, pulse at pi/2 rad) and clamp to
-    // the mechanism's real limits. Already slew-limited by the flight code
-    // (VehicleConfig::nacelle_rate_max).
+    //   negative = rotor leaning AFT of vertical
+    // Commanded range is VehicleConfig::nacelle_min_rad .. nacelle_max_rad
+    // (-15 .. +95.7 deg by default). Map with a per-side two-point calibration (pulse at 0 rad,
+    // pulse at pi/2 rad) and clamp to the mechanical stops. Already
+    // slew-limited by the flight code (VehicleConfig::nacelle_rate_max).
     float nacelle_left_rad  = 0.0f;
     float nacelle_right_rad = 0.0f;
 
@@ -61,7 +51,7 @@ struct ActuatorOutputs {
     //   aileron  +1 = roll right  (right aileron trailing edge UP, left DOWN)
     //   elevator +1 = nose up     (trailing edge UP)
     //   rudder   +1 = nose right  (trailing edge to the RIGHT, seen from behind)
-    // +/-1 = full mechanical throw. Handle servo reversal and trim in your
+    // +/-1 = full mechanical throw. Handle servo reversal and trim in the
     // library, never by flipping signs in the flight code.
     float aileron  = 0.0f;
     float elevator = 0.0f;
@@ -82,13 +72,13 @@ class ActuatorBackend {
     //   - Return quickly (target < 200 us): latch the values into hardware
     //     (LEDC/MCPWM/RMT registers) and return. No delay(), no Serial.
     //   - Called with armed=false continuously while disarmed.
-    //   - If your outputs go over the shared I2C bus (e.g. a PCA9685), take
-    //     `i2cMutex` (declared in main.cpp) with a short timeout (<= 2 ms)
+    //   - If outputs go over the shared I2C bus (e.g. a PCA9685), take
+    //     `i2cMutex` (defined in main.cpp) with a short timeout (<= 2 ms)
     //     and skip the update if you don't get it. Direct PWM pins are
     //     preferred - they need no bus at all.
-    //   - Strongly recommended: an output watchdog in your library - if
+    //   - Strongly recommended: an output watchdog in library - if
     //     write() hasn't been called for ~100 ms (flight task hung), drive
-    //     the ESCs to their stop signal on your own.
+    //     the ESCs to their stop signal on their own.
     virtual void write(const ActuatorOutputs &out) = 0;
 };
 
@@ -99,7 +89,7 @@ class ActuatorBackend {
 // Universal format: differential pressure in pascals, signed, with the
 // sensor's own transfer function (datasheet counts -> Pa) already applied,
 // POSITIVE when the pitot (total-pressure) port is above the static port.
-// Do NOT zero it yourself - the firmware averages the first 2 s after
+// Do NOT zero it - the firmware averages the first 2 s after
 // power-up as the zero offset (keep the pitot still and out of the wind, or
 // covered, during boot), filters it, checks it, and converts to airspeed
 // using live air density from the BMP280.

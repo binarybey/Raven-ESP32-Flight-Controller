@@ -76,3 +76,32 @@ void TelemetryLogger::logState(const VehicleState& st, const ActuatorCmd& cmd) {
 }
 
 } // namespace raven
+
+void printTelemetry(const TelemetrySnapshot &t) {
+    const raven::ActuatorCmd  &o = t.out;
+    const raven::VehicleState &v = t.st;
+    Serial.printf("%-10s %-7s %s fs=%-9s r=%6.1f p=%6.1f y=%6.1f agl=%6.1f vz=%+5.1f as=%4.1f a=%5.1f "
+                  "thr=%.2f/%.2f nac=%5.1f/%5.1f srf=%+.2f/%+.2f/%+.2f xte=%+6.1f dtg=%7.0f gs=%4.1f "
+                  "ter=%5.0f nav=%d mag=%d pit=%d %3.0fHz\n",
+        raven::flightModeName(o.mode), raven::missionPhaseName(o.phase),
+        o.armed ? "ARMED" : "safe ", raven::failsafeReasonName(o.fs_reason),
+        v.roll * RAD_TO_DEG, v.pitch * RAD_TO_DEG, v.yaw * RAD_TO_DEG,
+        v.agl, v.climb_rate, v.airspeed, o.alpha_cmd * RAD_TO_DEG,
+        o.thrust_left, o.thrust_right, o.nacelle_left * RAD_TO_DEG, o.nacelle_right * RAD_TO_DEG,
+        o.aileron, o.elevator, o.rudder,
+        o.cross_track_dbg, v.mission_distance_to_go, v.ground_speed,
+        v.terrain_valid ? v.terrain_elev_m : -1.0f,
+        v.nav_valid ? 1 : 0, t.raw.mag_valid ? 1 : 0, t.raw.pitot_valid ? 1 : 0, t.loop_hz);
+}
+
+void printVehicleReport(const raven::FlightKinematics &fk, const raven::VehicleConfig &cfg,
+                        uint32_t configIssues) {
+    Serial.printf("Vehicle: %.3f kg, hover thrust %.0f%% of max, wing stall %.1f m/s, cruise %.1f m/s\n",
+        cfg.mass, 100.0f * cfg.mass * cfg.g / (2.0f * cfg.thrust_max_per_rotor),
+        fk.stallSpeed(1.225f), cfg.cruise_airspeed);
+    for (uint32_t bit = 1; bit != 0 && bit <= configIssues; bit <<= 1) {
+        if (configIssues & bit)
+            Serial.printf("  CONFIG %s: %s\n", (bit & raven::CFG_FATAL_MASK) ? "FATAL" : "warning",
+                          raven::configIssueText(bit));
+    }
+}

@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include "flight_kinematics.h"
 #define GNSS_SERIAL_PORT 2
 #define GNSS_RX_PIN 16
 #define GNSS_TX_PIN 17
@@ -75,3 +76,7 @@ bool readNMEA(HardwareSerial* GNSS);
 // Copies the shared data under the mutex, then prints outside it - never
 // holds gnssMutex while waiting on the serial port.
 void printGNSS();
+
+// A copy of masterGNSSData -> the flight code's GNSS inputs (m/s, radians).
+// No course (typical when stationary) is treated as not moving.
+void gnssToRaw(const GNSSData &gnss, raven::RawSensors &raw);

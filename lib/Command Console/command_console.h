@@ -16,6 +16,8 @@
 #pragma once
 
 #include <Arduino.h>
+#include "flight_kinematics.h"
+#include "writeTelemetry.h"
 
 namespace raven {
 
@@ -39,5 +41,16 @@ class CommandConsole {
 };
 
 const char *commandHelpText();
+
+// arm / disarm / land travel from TaskConsole to TaskFlightControl (which
+// owns the FlightKinematics instance) through a queue, and the answer back.
+struct ConsoleRequest { Command cmd; };
+struct ConsoleReply   { bool ok; const char *msg; };
+
+// Runs on the flight-control task: applies arm / disarm / land to fk.
+ConsoleReply executeCommand(FlightKinematics &fk, Command cmd);
+
+// The 'status' command's printout.
+void printStatus(Stream &io, const TelemetrySnapshot &t, bool terrainReady, bool routeCovered);
 
 }  // namespace raven
